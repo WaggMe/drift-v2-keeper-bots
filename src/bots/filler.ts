@@ -60,6 +60,9 @@ import { Bot } from '../types';
 import { RuntimeSpec, metricAttrFromUserAccount } from '../metrics';
 import { webhookMessage } from '../webhook';
 
+require('dotenv').config();
+const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
+
 const MAX_TX_PACK_SIZE = 900; //1232;
 const CU_PER_FILL = 200_000; // CU cost for a successful fill
 const BURST_CU_PER_FILL = 350_000; // CU cost for a successful fill
@@ -940,6 +943,14 @@ export class FillerBot implements Bot {
 					nodeToFill.node.order.orderId
 				}, orderType: ${getVariant(nodeToFill.node.order.orderType)}`
 			);
+			webhookMessage(
+				`[${this.name}]: filling perp node ${idx}, marketIdx: ${
+					nodeToFill.node.order.marketIndex
+				}: ${nodeToFill.node.userAccount.toString()}, ${
+					nodeToFill.node.order.orderId
+				}, orderType: ${getVariant(nodeToFill.node.order.orderType)}`
+				,WEBHOOK_URL_FILLER
+			);
 			if (nodeToFill.makerNode) {
 				logger.info(
 					`filling\ntaker: ${nodeToFill.node.userAccount.toBase58()}-${
@@ -1092,6 +1103,13 @@ export class FillerBot implements Bot {
 							`parse logs took ${processBulkFillLogsDuration}ms, filled ${successfulFills}`
 						);
 
+						if(successfulFills>0){
+							webhookMessage(
+								`parse logs took ${processBulkFillLogsDuration}ms, filled ${successfulFills}`
+								,WEBHOOK_URL_FILLER
+							);
+						}
+
 						// record successful fills
 						const user = this.driftClient.getUser();
 						this.successfulFillsCounter.add(
@@ -1107,6 +1125,7 @@ export class FillerBot implements Bot {
 						logger.error(`Failed to process fill tx logs (error above):`);
 						webhookMessage(
 							`[${this.name}]: :x: error processing fill tx logs:\n${e}`
+							,WEBHOOK_URL_FILLER
 						);
 					});
 			})
@@ -1120,7 +1139,10 @@ export class FillerBot implements Bot {
 					logger.error(
 						`Failed to send tx, sim error tx logs took: ${Date.now() - start}ms`
 					);
-					webhookMessage(`[${this.name}]: :x: error simulating tx:\n${e}`);
+					webhookMessage(
+						`[${this.name}]: :x: error simulating tx:\n${e}`
+						,WEBHOOK_URL_FILLER
+					);
 				}
 			})
 			.finally(() => {
@@ -1208,7 +1230,10 @@ export class FillerBot implements Bot {
 			} else if (e === dlobMutexError) {
 				logger.error(`${this.name} dlobMutexError timeout`);
 			} else {
-				webhookMessage(`[${this.name}]: :x: uncaught error:\n${e}\n${e.stack}`);
+				webhookMessage(
+					`[${this.name}]: :x: uncaught error:\n${e}\n${e.stack}`
+					,WEBHOOK_URL_FILLER
+				);
 				throw e;
 			}
 		} finally {

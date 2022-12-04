@@ -45,6 +45,9 @@ import { Bot } from '../types';
 import { RuntimeSpec, metricAttrFromUserAccount } from '../metrics';
 import { webhookMessage } from '../webhook';
 
+require('dotenv').config();
+const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
+
 /**
  * Size of throttled nodes to get to before pruning the map
  */
@@ -575,7 +578,10 @@ export class SpotFillerBot implements Bot {
 			)
 			.then((tx) => {
 				logger.info(`Filled spot order ${nodeSignature}, TX: ${tx}`);
-
+				webhookMessage(
+					`[${this.name}]: Filled spot order ${nodeSignature}, TX: ${tx}`
+					,WEBHOOK_URL_FILLER
+				);
 				const duration = Date.now() - start;
 				const user = this.driftClient.getUser();
 				this.sdkCallDurationHistogram.record(duration, {
@@ -591,6 +597,7 @@ export class SpotFillerBot implements Bot {
 				logger.error(`Failed to fill spot order`);
 				webhookMessage(
 					`[${this.name}]: :x: error trying to fill spot orders:\n${e}`
+					,WEBHOOK_URL_FILLER
 				);
 			})
 			.finally(() => {
@@ -668,6 +675,7 @@ export class SpotFillerBot implements Bot {
 					console.error(e);
 					webhookMessage(
 						`[${this.name}]: :x: error trying to run main loop:\n${e}`
+						,WEBHOOK_URL_FILLER
 					);
 				}
 			})

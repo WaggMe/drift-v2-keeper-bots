@@ -19,6 +19,9 @@ import { getErrorCode } from '../error';
 import { Metrics } from '../metrics';
 import { webhookMessage } from '../webhook';
 
+require('dotenv').config();
+const WEBHOOK_URL_TRIGGER = process.env.WEBHOOK_URL_TRIGGER;
+
 const dlobMutexError = new Error('dlobMutex timeout');
 const USER_MAP_RESYNC_COOLDOWN_SLOTS = 200;
 
@@ -208,6 +211,7 @@ export class TriggerBot implements Bot {
 							`[${
 								this.name
 							}]: :gear: Triggered perp user (account: ${nodeToTrigger.node.userAccount.toString()}) perp order: ${nodeToTrigger.node.order.orderId.toString()}, tx: ${txSig}`
+							,WEBHOOK_URL_TRIGGER
 						);
 					})
 					.catch((error) => {
@@ -227,6 +231,7 @@ export class TriggerBot implements Bot {
 							`[${
 								this.name
 							}]: :x: Error (${errorCode}) triggering perp user (account: ${nodeToTrigger.node.userAccount.toString()}) perp order: ${nodeToTrigger.node.order.orderId.toString()}`
+							,WEBHOOK_URL_TRIGGER
 						);
 					});
 			}
@@ -235,7 +240,10 @@ export class TriggerBot implements Bot {
 				`Unexpected error for market ${marketIndex.toString()} during triggers`
 			);
 			console.error(e);
-			webhookMessage(`[${this.name}]: :x: Uncaught error:\n${e}\n${e.stack}`);
+			webhookMessage(
+				`[${this.name}]: :x: Uncaught error:\n${e}\n${e.stack}`
+				,WEBHOOK_URL_TRIGGER
+			);
 		}
 	}
 
@@ -286,6 +294,7 @@ export class TriggerBot implements Bot {
 							`[${
 								this.name
 							}]: :gear: Triggered user (account: ${nodeToTrigger.node.userAccount.toString()}) spot order: ${nodeToTrigger.node.order.orderId.toString()}, tx: ${txSig}`
+							,WEBHOOK_URL_TRIGGER
 						);
 					})
 					.catch((error) => {
@@ -305,6 +314,7 @@ export class TriggerBot implements Bot {
 							`[${
 								this.name
 							}]: :x: Error (${errorCode}) triggering spot order for user (account: ${nodeToTrigger.node.userAccount.toString()}) spot order: ${nodeToTrigger.node.order.orderId.toString()}`
+							,WEBHOOK_URL_TRIGGER
 						);
 					});
 			}
@@ -350,6 +360,7 @@ export class TriggerBot implements Bot {
 			} else {
 				webhookMessage(
 					`[${this.name}]: :x: Uncaught error in main loop:\n${e}\n${e.stack}`
+					,WEBHOOK_URL_TRIGGER
 				);
 				throw e;
 			}
