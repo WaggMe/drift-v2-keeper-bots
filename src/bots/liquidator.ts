@@ -179,7 +179,7 @@ async function liqPerpPnl(
 		}
 
 		if (frac.lt(new BN(100000000))) {
-			const start = Date.now();
+			//const start = Date.now();
 			driftClient
 				.liquidateBorrowForPerpPnl(
 					user.userAccountPublicKey,
@@ -217,11 +217,11 @@ async function liqPerpPnl(
 						,WEBHOOK_URL_LIQUIDATOR
 					);
 				})
-				.finally(() => {
+				/*.finally(() => {
 					sdkCallDurationHistogram.record(Date.now() - start, {
 						method: 'liquidateBorrowForPerpPnl',
 					});
-				});
+				})*/;
 		} else {
 			logger.info(
 				`claimablePnl=${claimablePnl.toString()} << liquidateePosition.quoteAssetAmount=${liquidateePosition.quoteAssetAmount.toString()} `
@@ -229,7 +229,7 @@ async function liqPerpPnl(
 			logger.info(`skipping liquidateBorrowForPerpPnl`);
 		}
 	} else {
-		const start = Date.now();
+		//const start = Date.now();
 		driftClient
 			.liquidatePerpPnlForDeposit(
 				user.userAccountPublicKey,
@@ -265,11 +265,11 @@ async function liqPerpPnl(
 					,WEBHOOK_URL_LIQUIDATOR
 				);
 			})
-			.finally(() => {
+			/*.finally(() => {
 				sdkCallDurationHistogram.record(Date.now() - start, {
 					method: 'liquidatePerpPnlForDeposit',
 				});
-			});
+			})*/;
 	}
 }
 
@@ -367,7 +367,7 @@ export class LiquidatorBot implements Bot {
 
 		this.metricsPort = metricsPort;
 		if (this.metricsPort) {
-			this.initializeMetrics();
+			//this.initializeMetrics();
 		}
 	}
 
@@ -534,7 +534,7 @@ export class LiquidatorBot implements Bot {
 						continue;
 					}
 
-					const start = Date.now();
+					//const start = Date.now();
 					this.driftClient
 						.placePerpOrder(
 							getMarketOrderParams({
@@ -559,13 +559,13 @@ export class LiquidatorBot implements Bot {
 								,WEBHOOK_URL_LIQUIDATOR
 							);
 						})
-						.then(() => {
+						/*.then(() => {
 							this.sdkCallDurationHistogram.record(Date.now() - start, {
 								method: 'placePerpOrder',
 							});
-						});
+						})*/;
 				} else if (position.quoteAssetAmount.lt(ZERO)) {
-					const start = Date.now();
+					//const start = Date.now();
 					this.driftClient
 						.settlePNL(
 							await this.driftClient.getUserAccountPublicKey(),
@@ -587,11 +587,11 @@ export class LiquidatorBot implements Bot {
 								,WEBHOOK_URL_LIQUIDATOR
 							);
 						})
-						.finally(() => {
+						/*.finally(() => {
 							this.sdkCallDurationHistogram.record(Date.now() - start, {
 								method: 'settlePNL',
 							});
-						});
+						})*/;
 				} else if (position.quoteAssetAmount.gt(ZERO)) {
 					const availablePnl = calculateMarketAvailablePNL(
 						this.driftClient.getPerpMarketAccount(position.marketIndex),
@@ -599,7 +599,7 @@ export class LiquidatorBot implements Bot {
 					);
 
 					if (availablePnl.gt(ZERO)) {
-						const start = Date.now();
+						//const start = Date.now();
 						this.driftClient
 							.settlePNL(
 								await this.driftClient.getUserAccountPublicKey(),
@@ -621,11 +621,11 @@ export class LiquidatorBot implements Bot {
 									,WEBHOOK_URL_LIQUIDATOR
 								);
 							})
-							.finally(() => {
+							/*.finally(() => {
 								this.sdkCallDurationHistogram.record(Date.now() - start, {
 									method: "'settlePNL",
 								});
-							});
+							})*/;
 					}
 				}
 			}
@@ -662,7 +662,7 @@ export class LiquidatorBot implements Bot {
 					position.marketIndex
 				);
 				if (isVariant(position.balanceType, 'deposit')) {
-					const start = Date.now();
+					//const start = Date.now();
 					this.driftClient
 						.placeAndTakeSpotOrder(
 							getMarketOrderParams({
@@ -688,13 +688,13 @@ export class LiquidatorBot implements Bot {
 								,WEBHOOK_URL_LIQUIDATOR
 							);
 						})
-						.finally(() => {
+						/*.finally(() => {
 							this.sdkCallDurationHistogram.record(Date.now() - start, {
 								method: 'placeAndTakeSpotOrder',
 							});
-						});
+						})*/;
 				} else {
-					const start = Date.now();
+					//const start = Date.now();
 					this.driftClient
 						.placeAndTakeSpotOrder(
 							getMarketOrderParams({
@@ -720,11 +720,11 @@ export class LiquidatorBot implements Bot {
 								,WEBHOOK_URL_LIQUIDATOR
 							);
 						})
-						.finally(() => {
+						/*.finally(() => {
 							this.sdkCallDurationHistogram.record(Date.now() - start, {
 								method: 'placeAndTakeSpotOrder',
 							});
-						});
+						})*/;
 				}
 			}
 		} finally {
@@ -825,7 +825,7 @@ export class LiquidatorBot implements Bot {
 				`Resolving perp market for userAcc: ${userKey.toBase58()}, marketIndex: ${perpIdx}`
 				,WEBHOOK_URL_LIQUIDATOR
 			);
-			const start = Date.now();
+			//const start = Date.now();
 			this.driftClient
 				.resolvePerpBankruptcy(userKey, userAcc, perpIdx)
 				.then((tx) => {
@@ -851,11 +851,11 @@ export class LiquidatorBot implements Bot {
 						,WEBHOOK_URL_LIQUIDATOR
 					);
 				})
-				.finally(() => {
+				/*.finally(() => {
 					this.sdkCallDurationHistogram.record(Date.now() - start, {
 						method: 'resolvePerpBankruptcy',
 					});
-				});
+				})*/;
 		}
 
 		for (const spotIdx of bankruptSpotMarkets) {
@@ -866,7 +866,7 @@ export class LiquidatorBot implements Bot {
 				`Resolving spot market for userAcc: ${userKey.toBase58()}, marketIndex: ${spotIdx}`
 				,WEBHOOK_URL_LIQUIDATOR
 			);
-			const start = Date.now();
+			//const start = Date.now();
 			this.driftClient
 				.resolveSpotBankruptcy(userKey, userAcc, spotIdx)
 				.then((tx) => {
@@ -892,11 +892,11 @@ export class LiquidatorBot implements Bot {
 						,WEBHOOK_URL_LIQUIDATOR
 					);
 				})
-				.finally(() => {
+				/*.finally(() => {
 					this.sdkCallDurationHistogram.record(Date.now() - start, {
 						method: 'resolveSpotBankruptcy',
 					});
-				});
+				})*/;
 		}
 	}
 
@@ -950,7 +950,7 @@ export class LiquidatorBot implements Bot {
 						);
 
 					if (borrowMarketIndextoLiq != -1 && depositMarketIndextoLiq != -1) {
-						const start = Date.now();
+						//const start = Date.now();
 						this.driftClient
 							.liquidateSpot(
 								user.userAccountPublicKey,
@@ -970,9 +970,9 @@ export class LiquidatorBot implements Bot {
 									`[${
 										this.name
 									}]: liquidateSpot user=${user.userAccountPublicKey.toString()}
-								(deposit_index=${depositMarketIndextoLiq} for borrow_index=${borrowMarketIndextoLiq}
-								maxBorrowAmount=${borrowAmountToLiq.toString()})
-								tx: ${tx}`
+									(deposit_index=${depositMarketIndextoLiq} for borrow_index=${borrowMarketIndextoLiq}
+									maxBorrowAmount=${borrowAmountToLiq.toString()})
+									tx: ${tx}`
 									,WEBHOOK_URL_LIQUIDATOR
 								);
 							})
@@ -988,11 +988,11 @@ export class LiquidatorBot implements Bot {
 									,WEBHOOK_URL_LIQUIDATOR
 								);
 							})
-							.finally(() => {
+							/*.finally(() => {
 								this.sdkCallDurationHistogram.record(Date.now() - start, {
 									method: 'liquidateSpot',
 								});
-							});
+							})*/;
 					}
 
 					const usdcMarket = this.driftClient.getSpotMarketAccount(
@@ -1035,7 +1035,7 @@ export class LiquidatorBot implements Bot {
 									'--dry run flag enabled - not sending liquidate tx'
 								);
 							}
-							const start = Date.now();
+							//const start = Date.now();
 							this.driftClient
 								.liquidatePerp(
 									user.userAccountPublicKey,
@@ -1064,11 +1064,11 @@ export class LiquidatorBot implements Bot {
 										,WEBHOOK_URL_LIQUIDATOR
 									);
 								})
-								.finally(() => {
+								/*.finally(() => {
 									this.sdkCallDurationHistogram.record(Date.now() - start, {
 										method: 'liquidatePerp',
 									});
-								});
+								})*/;
 						}
 					}
 				}
