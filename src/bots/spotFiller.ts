@@ -20,6 +20,7 @@ import {
 	getVariant,
 	SpotMarkets,
 	BulkAccountLoader,
+	OrderRecord,
 } from '@drift-labs/sdk';
 import { Mutex, tryAcquire, withTimeout, E_ALREADY_LOCKED } from 'async-mutex';
 
@@ -42,6 +43,7 @@ import {
 import { logger } from '../logger';
 import { Bot } from '../types';
 import { RuntimeSpec, metricAttrFromUserAccount } from '../metrics';
+import { webhookMessage } from '../webhook';
 
 /**
  * Size of throttled nodes to get to before pruning the map
@@ -331,12 +333,12 @@ export class SpotFillerBot implements Bot {
 		}
 
 		await Promise.all(initPromises);
+		await webhookMessage(`[${this.name}]: started`);
 	}
 
 	public async reset() {}
 
 	public async startIntervalLoop(intervalMs: number) {
-		// await this.tryFill();
 		const intervalId = setInterval(this.trySpotFill.bind(this), intervalMs);
 		this.intervalIds.push(intervalId);
 
@@ -357,7 +359,7 @@ export class SpotFillerBot implements Bot {
 		await this.userStatsMap.updateWithEventRecord(record, this.userMap);
 
 		if (record.eventType === 'OrderRecord') {
-			await this.trySpotFill();
+			await this.trySpotFill(record as OrderRecord);
 		} else if (record.eventType === 'OrderActionRecord') {
 			const actionRecord = record as OrderActionRecord;
 
@@ -432,7 +434,6 @@ export class SpotFillerBot implements Bot {
 								logger.info(`UserMaps resynced in ${Date.now() - start}ms`);
 							});
 					});
-					logger.warn('continuing spotfiller');
 				}
 			});
 		}
@@ -461,7 +462,9 @@ export class SpotFillerBot implements Bot {
 				oraclePriceData.slot.toNumber(),
 				Date.now() / 1000,
 				MarketType.SPOT,
-				oraclePriceData
+				oraclePriceData,
+				this.driftClient.getStateAccount(),
+				this.driftClient.getSpotMarketAccount(market.marketIndex)
 			);
 		});
 
@@ -586,13 +589,16 @@ export class SpotFillerBot implements Bot {
 			.catch((e) => {
 				console.error(e);
 				logger.error(`Failed to fill spot order`);
+				webhookMessage(
+					`[${this.name}]: :x: error trying to fill spot orders:\n${e}`
+				);
 			})
 			.finally(() => {
 				this.unthrottleNode(nodeSignature);
 			});
 	}
 
-	private async trySpotFill() {
+	private async trySpotFill(orderRecord?: OrderRecord) {
 		const startTime = Date.now();
 		let ran = false;
 
@@ -603,14 +609,11 @@ export class SpotFillerBot implements Bot {
 						this.dlob.clear();
 						delete this.dlob;
 					}
-					this.dlob = new DLOB(
-						this.driftClient.getPerpMarketAccounts(), // TODO: new sdk - remove this
-						this.driftClient.getSpotMarketAccounts(),
-						this.driftClient.getStateAccount(),
-						this.userMap,
-						true
-					);
-					await this.dlob.init();
+					this.dlob = new DLOB();
+					await this.dlob.initFromUserMap(this.userMap);
+					if (orderRecord) {
+						this.dlob.insertOrder(orderRecord.order, orderRecord.user);
+					}
 				});
 
 				await this.resyncUserMapsIfRequired();
@@ -663,6 +666,9 @@ export class SpotFillerBot implements Bot {
 				} else {
 					console.log('some other error...');
 					console.error(e);
+					webhookMessage(
+						`[${this.name}]: :x: error trying to run main loop:\n${e}`
+					);
 				}
 			})
 			.finally(async () => {

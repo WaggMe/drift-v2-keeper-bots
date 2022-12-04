@@ -25,6 +25,8 @@ import {
 	PerpMarkets,
 	OrderActionRecord,
 	BulkAccountLoader,
+	SlotSubscriber,
+	OrderRecord,
 } from '@drift-labs/sdk';
 import { TxSigAndSlot } from '@drift-labs/sdk/lib/tx/types';
 import { Mutex, tryAcquire, withTimeout, E_ALREADY_LOCKED } from 'async-mutex';
@@ -88,6 +90,7 @@ export class FillerBot implements Bot {
 	public readonly dryRun: boolean;
 	public readonly defaultIntervalMs: number = 2000;
 
+	private slotSubscriber: SlotSubscriber;
 	private bulkAccountLoader: BulkAccountLoader | undefined;
 	private driftClient: DriftClient;
 
@@ -139,6 +142,7 @@ export class FillerBot implements Bot {
 	constructor(
 		name: string,
 		dryRun: boolean,
+		slotSubscriber: SlotSubscriber,
 		bulkAccountLoader: BulkAccountLoader | undefined,
 		driftClient: DriftClient,
 		runtimeSpec: RuntimeSpec,
@@ -146,6 +150,7 @@ export class FillerBot implements Bot {
 	) {
 		this.name = name;
 		this.dryRun = dryRun;
+		this.slotSubscriber = slotSubscriber;
 		this.bulkAccountLoader = bulkAccountLoader;
 		this.driftClient = driftClient;
 		this.runtimeSpec = runtimeSpec;
@@ -341,6 +346,7 @@ export class FillerBot implements Bot {
 		initPromises.push(this.userStatsMap.fetchAllUserStats());
 
 		await Promise.all(initPromises);
+		await webhookMessage(`[${this.name}]: started`);
 	}
 
 	public async reset() {}
@@ -364,11 +370,15 @@ export class FillerBot implements Bot {
 	public async trigger(record: WrappedEvent<any>) {
 		await this.userMap.updateWithEventRecord(record);
 		await this.userStatsMap.updateWithEventRecord(record, this.userMap);
+		logger.info(`filler seen record: ${record.eventType}`);
 
 		if (record.eventType === 'OrderRecord') {
-			await this.tryFill();
+			await this.tryFill(record as OrderRecord);
 		} else if (record.eventType === 'OrderActionRecord') {
 			const actionRecord = record as OrderActionRecord;
+			logger.info(
+				`OrderRecordAction.action: ${getVariant(actionRecord.action)}`
+			);
 
 			if (getVariant(actionRecord.action) === 'fill') {
 				const marketType = getVariant(actionRecord.marketType);
@@ -444,7 +454,6 @@ export class FillerBot implements Bot {
 								logger.info(`UserMaps resynced in ${Date.now() - start}ms`);
 							});
 					});
-					logger.warn('continuing filler');
 				}
 			});
 		}
@@ -467,10 +476,12 @@ export class FillerBot implements Bot {
 				marketIndex,
 				vBid,
 				vAsk,
-				oraclePriceData.slot.toNumber(),
+				this.slotSubscriber.currentSlot,
 				Date.now() / 1000,
 				MarketType.PERP,
-				oraclePriceData
+				oraclePriceData,
+				this.driftClient.getStateAccount(),
+				this.driftClient.getPerpMarketAccount(marketIndex)
 			);
 		});
 
@@ -535,7 +546,7 @@ export class FillerBot implements Bot {
 			}
 		}
 
-		const marketIndex = nodeToFill.node.market.marketIndex;
+		const marketIndex = nodeToFill.node.order.marketIndex;
 		const oraclePriceData =
 			this.driftClient.getOracleDataForPerpMarket(marketIndex);
 
@@ -552,9 +563,11 @@ export class FillerBot implements Bot {
 			isVariant(nodeToFill.node.order.marketType, 'perp') &&
 			!isFillableByVAMM(
 				nodeToFill.node.order,
-				nodeToFill.node.market as PerpMarketAccount,
+				this.driftClient.getPerpMarketAccount(
+					nodeToFill.node.order.marketIndex
+				),
 				oraclePriceData,
-				oraclePriceData.slot.toNumber(),
+				this.slotSubscriber.currentSlot,
 				Date.now() / 1000
 			)
 		) {
@@ -568,18 +581,22 @@ export class FillerBot implements Bot {
 			logger.warn(
 				` . is not fillable by vamm: ${!isFillableByVAMM(
 					nodeToFill.node.order,
-					nodeToFill.node.market as PerpMarketAccount,
+					this.driftClient.getPerpMarketAccount(
+						nodeToFill.node.order.marketIndex
+					),
 					oraclePriceData,
-					oraclePriceData.slot.toNumber(),
+					this.slotSubscriber.currentSlot,
 					Date.now() / 1000
 				)}`
 			);
 			logger.warn(
 				` .     calculateBaseAssetAmountForAmmToFulfill: ${calculateBaseAssetAmountForAmmToFulfill(
 					nodeToFill.node.order,
-					nodeToFill.node.market as PerpMarketAccount,
+					this.driftClient.getPerpMarketAccount(
+						nodeToFill.node.order.marketIndex
+					),
 					oraclePriceData,
-					oraclePriceData.slot.toNumber()
+					this.slotSubscriber.currentSlot
 				).toString()}`
 			);
 			return false;
@@ -588,10 +605,11 @@ export class FillerBot implements Bot {
 		// if making with vAMM, ensure valid oracle
 		if (!nodeToFill.makerNode) {
 			const oracleIsValid = isOracleValid(
-				(nodeToFill.node.market as PerpMarketAccount).amm,
+				this.driftClient.getPerpMarketAccount(nodeToFill.node.order.marketIndex)
+					.amm,
 				oraclePriceData,
 				this.driftClient.getStateAccount().oracleGuardRails,
-				oraclePriceData.slot.toNumber() // should use slot subscriber here?
+				this.slotSubscriber.currentSlot
 			);
 			if (!oracleIsValid) {
 				logger.error(`Oracle is not valid for market ${marketIndex}`);
@@ -1073,10 +1091,6 @@ export class FillerBot implements Bot {
 						logger.info(
 							`parse logs took ${processBulkFillLogsDuration}ms, filled ${successfulFills}`
 						);
-						if(successfulFills > 0){
-							webhookMessage(`FILLER: :white_check_mark: orders filled for users, parse logs took ${processBulkFillLogsDuration}ms, filled ${successfulFills}` );
-						}
-							
 
 						// record successful fills
 						const user = this.driftClient.getUser();
@@ -1091,6 +1105,9 @@ export class FillerBot implements Bot {
 					.catch((e) => {
 						console.error(e);
 						logger.error(`Failed to process fill tx logs (error above):`);
+						webhookMessage(
+							`[${this.name}]: :x: error processing fill tx logs:\n${e}`
+						);
 					});
 			})
 			.catch((e) => {
@@ -1103,6 +1120,7 @@ export class FillerBot implements Bot {
 					logger.error(
 						`Failed to send tx, sim error tx logs took: ${Date.now() - start}ms`
 					);
+					webhookMessage(`[${this.name}]: :x: error simulating tx:\n${e}`);
 				}
 			})
 			.finally(() => {
@@ -1112,7 +1130,7 @@ export class FillerBot implements Bot {
 		return [txSig, nodesSent.length];
 	}
 
-	private async tryFill() {
+	private async tryFill(orderRecord?: OrderRecord) {
 		const startTime = Date.now();
 		let ran = false;
 		try {
@@ -1122,14 +1140,11 @@ export class FillerBot implements Bot {
 						this.dlob.clear();
 						delete this.dlob;
 					}
-					this.dlob = new DLOB(
-						this.driftClient.getPerpMarketAccounts(),
-						this.driftClient.getSpotMarketAccounts(),
-						this.driftClient.getStateAccount(),
-						this.userMap,
-						true
-					);
-					await this.dlob.init();
+					this.dlob = new DLOB();
+					await this.dlob.initFromUserMap(this.userMap);
+					if (orderRecord) {
+						this.dlob.insertOrder(orderRecord.order, orderRecord.user);
+					}
 				});
 
 				await this.resyncUserMapsIfRequired();
@@ -1193,6 +1208,7 @@ export class FillerBot implements Bot {
 			} else if (e === dlobMutexError) {
 				logger.error(`${this.name} dlobMutexError timeout`);
 			} else {
+				webhookMessage(`[${this.name}]: :x: uncaught error:\n${e}\n${e.stack}`);
 				throw e;
 			}
 		} finally {

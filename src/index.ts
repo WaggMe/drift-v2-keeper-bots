@@ -42,13 +42,13 @@ import { LiquidatorBot } from './bots/liquidator';
 import { FloatingPerpMakerBot } from './bots/floatingMaker';
 import { Bot } from './types';
 import { Metrics } from './metrics';
-import { PnlSettlerBot } from './bots/pnlSettler';
+import { IFRevenueSettlerBot } from './bots/ifRevenueSettler';
+import { UserPnlSettlerBot } from './bots/userPnlSettler';
 import {
 	getOrCreateAssociatedTokenAccount,
 	TOKEN_FAUCET_PROGRAM_ID,
 } from './utils';
 import { PrometheusExporter } from '@opentelemetry/exporter-prometheus';
-import { webhookMessage } from './webhook';
 import { bs58 } from '@project-serum/anchor/dist/cjs/utils/bytes';
 
 require('dotenv').config();
@@ -75,7 +75,8 @@ program
 	.option('--jit-maker', 'Enable JIT auction maker bot')
 	.option('--floating-maker', 'Enable floating maker bot')
 	.option('--liquidator', 'Enable liquidator bot')
-	.option('--pnl-settler', 'Enable PnL settler bot')
+	.option('--if-revenue-settler', 'Enable Insurance Fund PnL settler bot')
+	.option('--user-pnl-settler', 'Enable User PnL settler bot')
 	.option('--cancel-open-orders', 'Cancel open orders on startup')
 	.option('--close-open-positions', 'close all open positions')
 	.option('--test-liveness', 'Purposefully fail liveness test after 1 minute')
@@ -91,6 +92,10 @@ program
 		).env('KEEPER_PRIVATE_KEY')
 	)
 	.option('--debug', 'Enable debug logging')
+	.option(
+		'--run-once',
+		'Exit after running bot loops once (only for supported bots)'
+	)
 	.parse();
 
 const opts = program.opts();
@@ -101,7 +106,8 @@ FillerBot enabled: ${!!opts.filler},\n\
 SpotFillerBot enabled: ${!!opts.spotFiller},\n\
 TriggerBot enabled: ${!!opts.trigger},\n\
 JitMakerBot enabled: ${!!opts.jitMaker},\n\
-PnlSettler enabled: ${!!opts.pnlSettler},\n\
+IFRevenueSettler enabled: ${!!opts.ifRevenueSettler},\n\
+userPnlSettler enabled: ${!!opts.userPnlSettler},\n\
 `);
 
 export function getWallet(): Wallet {
@@ -449,6 +455,7 @@ const runBot = async () => {
 			new FillerBot(
 				'filler',
 				!!opts.dry,
+				slotSubscriber,
 				bulkAccountLoader,
 				driftClient,
 				{
@@ -533,10 +540,10 @@ const runBot = async () => {
 		);
 	}
 
-	if (opts.pnlSettler) {
+	if (opts.userPnlSettler) {
 		bots.push(
-			new PnlSettlerBot(
-				'pnlSettler',
+			new UserPnlSettlerBot(
+				'userPnlSettler',
 				!!opts.dry,
 				driftClient,
 				PerpMarkets[driftEnv],
@@ -546,11 +553,21 @@ const runBot = async () => {
 		);
 	}
 
+	if (opts.ifRevenueSettler) {
+		bots.push(
+			new IFRevenueSettlerBot(
+				'ifRevenueSettler',
+				!!opts.dry,
+				driftClient,
+				SpotMarkets[driftEnv]
+			)
+		);
+	}
+
 	logger.info(`initializing bots`);
 	await Promise.all(bots.map((bot) => bot.init()));
 
 	logger.info(`starting bots`);
-	webhookMessage(`starting bots`);
 	await Promise.all(
 		bots.map((bot) => bot.startIntervalLoop(bot.defaultIntervalMs))
 	);
@@ -622,11 +639,15 @@ const runBot = async () => {
 		})
 		.listen(healthCheckPort);
 	logger.info(`Health check server listening on port ${healthCheckPort}`);
+
+	if (opts.runOnce) {
+		process.exit(0);
+	}
 };
 
 async function recursiveTryCatch(f: () => void) {
 	try {
-		await f();
+		f();
 	} catch (e) {
 		console.error(e);
 		for (const bot of bots) {

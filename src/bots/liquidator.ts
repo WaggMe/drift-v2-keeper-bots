@@ -53,19 +53,19 @@ import { webhookMessage } from '../webhook';
 const USER_MAP_RESYNC_COOLDOWN_SLOTS = 300;
 
 function calculateSpotTokenAmountToLiquidate(
-	clearingHouse: DriftClient,
+	driftClient: DriftClient,
 	liquidatorUser: User,
 	liquidateePosition: SpotPosition,
 	MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL: BN,
 	MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM: BN
 ): BN {
-	const spotMarket = clearingHouse.getSpotMarketAccount(
+	const spotMarket = driftClient.getSpotMarketAccount(
 		liquidateePosition.marketIndex
 	);
 
 	const tokenPrecision = new BN(10 ** spotMarket.decimals);
 
-	const oraclePrice = clearingHouse.getOracleDataForSpotMarket(
+	const oraclePrice = driftClient.getOracleDataForSpotMarket(
 		liquidateePosition.marketIndex
 	).price;
 	const collateralToSpend = liquidatorUser
@@ -93,7 +93,7 @@ function calculateSpotTokenAmountToLiquidate(
 }
 
 function findBestSpotPosition(
-	clearingHouse: DriftClient,
+	driftClient: DriftClient,
 	liquidatorUser: User,
 	spotPositions: SpotPosition[],
 	isBorrow: boolean,
@@ -117,9 +117,9 @@ function findBestSpotPosition(
 			continue;
 		}
 
-		const spotMarket = clearingHouse.getSpotMarketAccount(position.marketIndex);
+		const spotMarket = driftClient.getSpotMarketAccount(position.marketIndex);
 		const tokenAmount = calculateSpotTokenAmountToLiquidate(
-			clearingHouse,
+			driftClient,
 			liquidatorUser,
 			position,
 			positionTakerOverPctNumerator,
@@ -185,12 +185,31 @@ async function liqPerpPnl(
 					borrowAmountToLiq.div(frac)
 				)
 				.then((tx) => {
-					logger.info(`liquidateBorrowForPerpPnl tx: ${tx}`);
-					webhookMessage(`liquidateBorrowForPerpPnl tx: ${tx}`);
+					logger.info(
+						`liquidateBorrowForPerpPnl for ${user.userAccountPublicKey.toBase58()} on market ${
+							liquidateePosition.marketIndex
+						} tx: ${tx}`
+					);
+					webhookMessage(
+						`[${
+							this.name
+						}]: liquidateBorrowForPerpPnl for ${user.userAccountPublicKey.toBase58()} on market ${
+							liquidateePosition.marketIndex
+						} tx: ${tx}`
+					);
 				})
 				.catch((e) => {
-					logger.error('Error in liquidateBorrowForPerpPnl');
+					logger.error(
+						'Error in liquidateBorrowForPerpPnl for ${user.userAccountPublicKey.toBase58()} on market ${liquidateePosition.marketIndex} '
+					);
 					logger.error(e);
+					webhookMessage(
+						`[${
+							this.name
+						}]: :x: error in liquidateBorrowForPerpPnl for ${user.userAccountPublicKey.toBase58()} on market ${
+							liquidateePosition.marketIndex
+						} :\n${e}`
+					);
 				})
 				.finally(() => {
 					sdkCallDurationHistogram.record(Date.now() - start, {
@@ -214,12 +233,29 @@ async function liqPerpPnl(
 				depositAmountToLiq
 			)
 			.then((tx) => {
-				logger.info(`did liquidatePerpPnlForDeposit tx: ${tx}`);
-				webhookMessage(`did liquidatePerpPnlForDeposit tx: ${tx}`);
+				logger.info(
+					`did liquidatePerpPnlForDeposit for ${user.userAccountPublicKey.toBase58()} on market ${
+						liquidateePosition.marketIndex
+					} tx: ${tx}`
+				);
+				webhookMessage(
+					`[${
+						this.name
+					}]: liquidatePerpPnlForDeposit for ${user.userAccountPublicKey.toBase58()} on market ${
+						liquidateePosition.marketIndex
+					} tx: ${tx}`
+				);
 			})
 			.catch((e) => {
 				console.error(e);
 				logger.error('Error in liquidatePerpPnlForDeposit');
+				webhookMessage(
+					`[${
+						this.name
+					}]: :x: error in liquidatePerpPnlForDeposit for ${user.userAccountPublicKey.toBase58()} on market ${
+						liquidateePosition.marketIndex
+					} :\n${e}`
+				);
 			})
 			.finally(() => {
 				sdkCallDurationHistogram.record(Date.now() - start, {
@@ -347,6 +383,7 @@ export class LiquidatorBot implements Bot {
 		}
 
 		await this.userMap.fetchAllUsers();
+		await webhookMessage(`[${this.name}]: started`);
 	}
 
 	public async reset() {
@@ -409,7 +446,6 @@ export class LiquidatorBot implements Bot {
 						.finally(() => {
 							logger.info(`UserMaps resynced in ${Date.now() - start}ms`);
 						});
-					logger.warn('continuing liquidator');
 				}
 			});
 		}
@@ -510,6 +546,9 @@ export class LiquidatorBot implements Bot {
 							logger.error(
 								`Error trying to close perp position for market ${position.marketIndex}`
 							);
+							webhookMessage(
+								`[${this.name}]: :x: error in placePerpOrder\n: ${e}`
+							);
 						})
 						.then(() => {
 							this.sdkCallDurationHistogram.record(Date.now() - start, {
@@ -533,6 +572,9 @@ export class LiquidatorBot implements Bot {
 							logger.error(e);
 							logger.error(
 								`Error trying to settle negative perp pnl for market ${position.marketIndex}`
+							);
+							webhookMessage(
+								`[${this.name}]: :x: error in settlePNL for negative pnl\n: ${e}`
 							);
 						})
 						.finally(() => {
@@ -563,6 +605,9 @@ export class LiquidatorBot implements Bot {
 								logger.error(e);
 								logger.error(
 									`Error trying to settle positive perp pnl for market ${position.marketIndex}`
+								);
+								webhookMessage(
+									`[${this.name}]: :x: error in settlePNL for positive pnl\n: ${e}`
 								);
 							})
 							.finally(() => {
@@ -627,6 +672,9 @@ export class LiquidatorBot implements Bot {
 							logger.error(
 								`Error trying to close spot position for market ${position.marketIndex}`
 							);
+							webhookMessage(
+								`[${this.name}]: :x: error trying to close spot position on market ${position.marketIndex}\n: ${e}`
+							);
 						})
 						.finally(() => {
 							this.sdkCallDurationHistogram.record(Date.now() - start, {
@@ -654,6 +702,9 @@ export class LiquidatorBot implements Bot {
 							logger.error(e);
 							logger.error(
 								`Error trying to close spot position for market ${position.marketIndex}`
+							);
+							webhookMessage(
+								`[${this.name}]: :x: error trying to close spot position on market ${position.marketIndex}\n: ${e}`
 							);
 						})
 						.finally(() => {
@@ -757,7 +808,11 @@ export class LiquidatorBot implements Bot {
 			logger.info(
 				`Resolving perp market for userAcc: ${userKey.toBase58()}, marketIndex: ${perpIdx}`
 			);
-			webhookMessage(`Resolving perp market for userAcc: ${userKey.toBase58()}, marketIndex: ${perpIdx}`);
+			webhookMessage(
+				`[${
+					this.name
+				}]: Resolving perp market for userAcc: ${userKey.toBase58()}, marketIndex: ${perpIdx}`
+			);
 			const start = Date.now();
 			this.driftClient
 				.resolvePerpBankruptcy(userKey, userAcc, perpIdx)
@@ -766,13 +821,20 @@ export class LiquidatorBot implements Bot {
 						`Resolved perp bankruptcy for userAcc: ${userKey.toBase58()}, marketIndex: ${perpIdx}: ${tx}`
 					);
 					webhookMessage(
-						`LIQ: Resolved perp market for userAcc: ${userKey.toBase58()}, marketIndex: ${perpIdx}: ${tx}`
+						`[${
+							this.name
+						}]: Resolved perp market for userAcc: ${userKey.toBase58()}, marketIndex: ${perpIdx}: ${tx}`
 					);
 				})
 				.catch((e) => {
 					logger.error(e);
 					logger.error(
 						`Error resolvePerpBankruptcy for ${userKey.toBase58()}, auth: ${userAcc.authority.toBase58()}`
+					);
+					webhookMessage(
+						`[${
+							this.name
+						}]: :x: Error resolvePerpBankruptcy for ${userKey.toBase58()}, auth: ${userAcc.authority.toBase58()}\n: ${e}`
 					);
 				})
 				.finally(() => {
@@ -786,7 +848,11 @@ export class LiquidatorBot implements Bot {
 			logger.info(
 				`Resolving spot market for userAcc: ${userKey.toBase58()}, marketIndex: ${spotIdx}`
 			);
-			webhookMessage(`Resolving spot market for userAcc: ${userKey.toBase58()}, marketIndex: ${spotIdx}`);
+			webhookMessage(
+				`[${
+					this.name
+				}]: Resolving spot market for userAcc: ${userKey.toBase58()}, marketIndex: ${spotIdx}`
+			);
 			const start = Date.now();
 			this.driftClient
 				.resolveSpotBankruptcy(userKey, userAcc, spotIdx)
@@ -795,13 +861,20 @@ export class LiquidatorBot implements Bot {
 						`Resolved spot market for userAcc: ${userKey.toBase58()}, marketIndex: ${spotIdx}: ${tx}`
 					);
 					webhookMessage(
-						`LIQ: Resolved spot market for userAcc: ${userKey.toBase58()}, marketIndex: ${spotIdx}: ${tx}`
+						`[${
+							this.name
+						}]: Resolved spot market for userAcc: ${userKey.toBase58()}, marketIndex: ${spotIdx}: ${tx}`
 					);
 				})
 				.catch((e) => {
 					logger.error(e);
 					logger.error(
 						`Error resolveSpotpBankruptcy for ${userKey.toBase58()}, auth: ${userAcc.authority.toBase58()}`
+					);
+					webhookMessage(
+						`[${
+							this.name
+						}]: :x: Error resolveSpotBankruptcy for ${userKey.toBase58()}, auth: ${userAcc.authority.toBase58()}\n: ${e}`
 					);
 				})
 				.finally(() => {
@@ -832,7 +905,7 @@ export class LiquidatorBot implements Bot {
 					await this.tryResolveBankruptUser(user);
 				} else if (user.canBeLiquidated()) {
 					logger.info(`liquidating ${auth}: ${userKey}...`);
-					webhookMessage(`LIQ: liquidating ${auth}: ${userKey} ...`);
+					webhookMessage(`[${this.name}]: liquidating ${auth}: ${userKey} ...`);
 
 					const liquidatorUser = this.driftClient.getUser();
 					const liquidateeUserAccount = user.getUserAccount();
@@ -876,15 +949,24 @@ export class LiquidatorBot implements Bot {
 								tx: ${tx}`
 								);
 								webhookMessage(
-									`liquidateSpot user=${user.userAccountPublicKey.toString()}
+									`[${
+										this.name
+									}]: liquidateSpot user=${user.userAccountPublicKey.toString()}
 								(deposit_index=${depositMarketIndextoLiq} for borrow_index=${borrowMarketIndextoLiq}
 								maxBorrowAmount=${borrowAmountToLiq.toString()})
 								tx: ${tx}`
 								);
 							})
 							.catch((e) => {
-								logger.error('Error in liquidateSpot');
+								logger.error(
+									`Error in liquidateSpot for user ${user.userAccountPublicKey.toBase58()} on market ${depositMarketIndextoLiq} for borrow index: ${borrowMarketIndextoLiq}`
+								);
 								logger.error(e);
+								webhookMessage(
+									`[${
+										this.name
+									}]: :x: Error in liquidateSpot for user ${user.userAccountPublicKey.toBase58()} on market ${depositMarketIndextoLiq} for borrow index: ${borrowMarketIndextoLiq}\n: ${e}`
+								);
 							})
 							.finally(() => {
 								this.sdkCallDurationHistogram.record(Date.now() - start, {
@@ -943,14 +1025,22 @@ export class LiquidatorBot implements Bot {
 								)
 								.then((tx) => {
 									logger.info(`liquidatePerp tx: ${tx}`);
-									webhookMessage(`LIQ: :money_mouth: liquidatePerp tx: ${tx}`);
+									webhookMessage(
+										`[${
+											this.name
+										}]: liquidatePerp for ${user.userAccountPublicKey.toBase58()} on market ${
+											liquidateePosition.marketIndex
+										} tx: ${tx}`
+									);
 								})
 								.catch((e) => {
 									logger.error(
-										`Error liquidating auth: ${auth}, user: ${userKey}`
+										`Error liquidating auth: ${auth}, user: ${userKey} on market ${liquidateePosition.marketIndex}`
 									);
-									webhookMessage(`LIQ: :x: Error liquidating auth: ${auth}, user: ${userKey}`);
 									console.error(e);
+									webhookMessage(
+										`[${this.name}]: :x: Error liquidating auth: ${auth}, user: ${userKey} on market ${liquidateePosition.marketIndex}`
+									);
 								})
 								.finally(() => {
 									this.sdkCallDurationHistogram.record(Date.now() - start, {
@@ -965,6 +1055,7 @@ export class LiquidatorBot implements Bot {
 			ran = true;
 		} catch (e) {
 			console.error(e);
+			webhookMessage(`[${this.name}]: :x: uncaught error:\n${e}\n${e.stack}`);
 		} finally {
 			if (ran) {
 				logger.debug(`${this.name} Bot took ${Date.now() - start}ms to run`);
