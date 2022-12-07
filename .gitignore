@@ -140,3 +140,4 @@ src/**.js.map
 
 .env
 lib
+ecosystem.config.js

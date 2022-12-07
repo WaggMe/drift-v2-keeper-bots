@@ -45,6 +45,9 @@ import { Bot } from '../types';
 import { RuntimeSpec, metricAttrFromUserAccount } from '../metrics';
 import { webhookMessage } from '../webhook';
 
+require('dotenv').config();
+const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
+
 /**
  * Size of throttled nodes to get to before pruning the map
  */
@@ -145,7 +148,7 @@ export class SpotFillerBot implements Bot {
 
 		this.metricsPort = metricsPort;
 		if (this.metricsPort) {
-			this.initializeMetrics();
+			//this.initializeMetrics();
 		}
 	}
 
@@ -192,8 +195,8 @@ export class SpotFillerBot implements Bot {
 			],
 		});
 
-		meterProvider.addMetricReader(this.exporter);
-		this.meter = meterProvider.getMeter(meterName);
+		//meterProvider.addMetricReader(this.exporter);
+		//this.meter = meterProvider.getMeter(meterName);
 
 		this.bootTimeMs = Date.now();
 
@@ -575,8 +578,11 @@ export class SpotFillerBot implements Bot {
 			)
 			.then((tx) => {
 				logger.info(`Filled spot order ${nodeSignature}, TX: ${tx}`);
-
-				const duration = Date.now() - start;
+				webhookMessage(
+					`[${this.name}]: Filled spot order ${nodeSignature}, TX: ${tx}`
+					,WEBHOOK_URL_FILLER
+				);
+				/*const duration = Date.now() - start;
 				const user = this.driftClient.getUser();
 				this.sdkCallDurationHistogram.record(duration, {
 					...metricAttrFromUserAccount(
@@ -584,7 +590,7 @@ export class SpotFillerBot implements Bot {
 						user.getUserAccount()
 					),
 					method: 'fillSpotOrder',
-				});
+				});*/
 			})
 			.catch((e) => {
 				console.error(e);
@@ -593,6 +599,7 @@ export class SpotFillerBot implements Bot {
 					`[${this.name}]: :x: error trying to fill spot orders:\n${
 						e.stack ? e.stack : e.message
 					}`
+          ,WEBHOOK_URL_FILLER
 				);
 			})
 			.finally(() => {
@@ -637,13 +644,13 @@ export class SpotFillerBot implements Bot {
 				}
 
 				const user = this.driftClient.getUser();
-				this.attemptedFillsCounter.add(
+				/*this.attemptedFillsCounter.add(
 					fillableNodes.length,
 					metricAttrFromUserAccount(
 						user.userAccountPublicKey,
 						user.getUserAccount()
 					)
-				);
+				);*/
 
 				await Promise.all(
 					fillableNodes.map(async (spotNodeToFill) => {
@@ -656,13 +663,13 @@ export class SpotFillerBot implements Bot {
 			.catch((e) => {
 				if (e === E_ALREADY_LOCKED) {
 					const user = this.driftClient.getUser();
-					this.mutexBusyCounter.add(
+					/*this.mutexBusyCounter.add(
 						1,
 						metricAttrFromUserAccount(
 							user.getUserAccountPublicKey(),
 							user.getUserAccount()
 						)
-					);
+					);*/
 				} else if (e === dlobMutexError) {
 					logger.error(`${this.name} dlobMutexError timeout`);
 				} else {
@@ -672,20 +679,21 @@ export class SpotFillerBot implements Bot {
 						`[${this.name}]: :x: error trying to run main loop:\n${
 							e.stack ? e.stack : e.message
 						}`
+            ,WEBHOOK_URL_FILLER
 					);
 				}
 			})
 			.finally(async () => {
 				if (ran) {
 					const duration = Date.now() - startTime;
-					const user = this.driftClient.getUser();
+					/*const user = this.driftClient.getUser();
 					this.tryFillDurationHistogram.record(
 						duration,
 						metricAttrFromUserAccount(
 							user.getUserAccountPublicKey(),
 							user.getUserAccount()
 						)
-					);
+					);*/
 					logger.debug(`trySpotFill done, took ${duration}ms`);
 
 					await this.watchdogTimerMutex.runExclusive(async () => {
