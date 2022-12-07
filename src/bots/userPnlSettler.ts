@@ -162,7 +162,7 @@ export class UserPnlSettlerBot implements Bot {
 					const marketIndexNum = settleePosition.marketIndex;
 					const unsettledPnl = calculateClaimablePnl(
 						perpMarketAndOracleData[marketIndexNum].marketAccount,
-						spotMarketAndOracleData[marketIndexNum].marketAccount,
+						spotMarketAndOracleData[0].marketAccount, // always liquidating the USDC spot market
 						settleePosition,
 						perpMarketAndOracleData[marketIndexNum].oraclePriceData
 					);
@@ -246,15 +246,22 @@ export class UserPnlSettlerBot implements Bot {
 						logger.error(
 							`Error code: ${errorCode} while settling pnls for ${marketStr}: ${err.message}`
 						);
-						webhookMessage(
-							`[${this.name}]: :x: Error code: ${errorCode} while settling pnls for ${marketStr}: ${err.message}`
+						console.error(err);
+						await webhookMessage(
+							`[${
+								this.name
+							}]: :x: Error code: ${errorCode} while settling pnls for ${marketStr}:\n${
+								err.logs || ''
+							}\n${err.stack ? err.stack : err.message}`
 						);
 					}
 				}
 			}
 		} catch (e) {
 			console.error(e);
-			webhookMessage(`[${this.name}]: :x: uncaught error:\n${e}\n${e.stack}`);
+			await webhookMessage(
+				`[${this.name}]: :x: uncaught error:\n${e.stack ? e.stack : e.messaage}`
+			);
 		} finally {
 			logger.info('Settle PNLs finished');
 			await this.watchdogTimerMutex.runExclusive(async () => {

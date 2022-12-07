@@ -230,8 +230,10 @@ export class TriggerBot implements Bot {
 						webhookMessage(
 							`[${
 								this.name
-							}]: :x: Error (${errorCode}) triggering perp user (account: ${nodeToTrigger.node.userAccount.toString()}) perp order: ${nodeToTrigger.node.order.orderId.toString()}`
-							,WEBHOOK_URL_TRIGGER
+							}]: :x: Error (${errorCode}) triggering perp user (account: ${nodeToTrigger.node.userAccount.toString()}) perp order: ${nodeToTrigger.node.order.orderId.toString()}\n${
+								error.stack ? error.stack : error.message
+							}`
+              ,WEBHOOK_URL_TRIGGER
 						);
 					});
 			}
@@ -241,8 +243,8 @@ export class TriggerBot implements Bot {
 			);
 			console.error(e);
 			webhookMessage(
-				`[${this.name}]: :x: Uncaught error:\n${e}\n${e.stack}`
-				,WEBHOOK_URL_TRIGGER
+				`[${this.name}]: :x: Uncaught error:\n${e.stack ? e.stack : e.message}}`
+        ,WEBHOOK_URL_TRIGGER
 			);
 		}
 	}
@@ -313,8 +315,10 @@ export class TriggerBot implements Bot {
 						webhookMessage(
 							`[${
 								this.name
-							}]: :x: Error (${errorCode}) triggering spot order for user (account: ${nodeToTrigger.node.userAccount.toString()}) spot order: ${nodeToTrigger.node.order.orderId.toString()}`
-							,WEBHOOK_URL_TRIGGER
+							}]: :x: Error (${errorCode}) triggering spot order for user (account: ${nodeToTrigger.node.userAccount.toString()}) spot order: ${nodeToTrigger.node.order.orderId.toString()}\n${
+								error.stack ? error.stack : error.message
+							}`
+              ,WEBHOOK_URL_TRIGGER
 						);
 					});
 			}
@@ -359,8 +363,10 @@ export class TriggerBot implements Bot {
 				logger.error(`${this.name} dlobMutexError timeout`);
 			} else {
 				webhookMessage(
-					`[${this.name}]: :x: Uncaught error in main loop:\n${e}\n${e.stack}`
-					,WEBHOOK_URL_TRIGGER
+					`[${this.name}]: :x: Uncaught error in main loop:\n${
+						e.stack ? e.stack : e.message
+					}`
+          ,WEBHOOK_URL_TRIGGER
 				);
 				throw e;
 			}
