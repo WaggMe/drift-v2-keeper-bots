@@ -14,6 +14,8 @@ import {
 	OrderRecord,
 	UserMap,
 	ZERO,
+	calculateNetUserPnlImbalance,
+	convertToNumber,
 } from '@drift-labs/sdk';
 import { Mutex } from 'async-mutex';
 
@@ -80,6 +82,9 @@ export class UserPnlSettlerBot implements Bot {
 			clearInterval(intervalId);
 		}
 		this.intervalIds = [];
+		for (const user of this.userMap.values()) {
+			await user.unsubscribe();
+		}
 		delete this.userMap;
 	}
 
@@ -162,7 +167,7 @@ export class UserPnlSettlerBot implements Bot {
 					const marketIndexNum = settleePosition.marketIndex;
 					const unsettledPnl = calculateClaimablePnl(
 						perpMarketAndOracleData[marketIndexNum].marketAccount,
-						spotMarketAndOracleData[marketIndexNum].marketAccount,
+						spotMarketAndOracleData[0].marketAccount, // always liquidating the USDC spot market
 						settleePosition,
 						perpMarketAndOracleData[marketIndexNum].oraclePriceData
 					);
@@ -173,6 +178,26 @@ export class UserPnlSettlerBot implements Bot {
 						!settleePosition.baseAssetAmount.eq(ZERO)
 					) {
 						continue;
+					}
+
+					if (unsettledPnl.gt(ZERO)) {
+						const pnlImbalance = calculateNetUserPnlImbalance(
+							perpMarketAndOracleData[marketIndexNum].marketAccount,
+							spotMarketAndOracleData[0].marketAccount,
+							perpMarketAndOracleData[marketIndexNum].oraclePriceData
+						).mul(new BN(-1));
+
+						if (pnlImbalance.lte(ZERO)) {
+							logger.warn(
+								`Want to settle positive PnL for user ${user
+									.getUserAccountPublicKey()
+									.toBase58()} in market ${marketIndexNum}, but there is a pnl imbalance (${convertToNumber(
+									pnlImbalance,
+									QUOTE_PRECISION
+								)})`
+							);
+							continue;
+						}
 					}
 
 					// only settle user pnl if they have enough collateral
@@ -246,15 +271,22 @@ export class UserPnlSettlerBot implements Bot {
 						logger.error(
 							`Error code: ${errorCode} while settling pnls for ${marketStr}: ${err.message}`
 						);
-						webhookMessage(
-							`[${this.name}]: :x: Error code: ${errorCode} while settling pnls for ${marketStr}: ${err.message}`
+						console.error(err);
+						await webhookMessage(
+							`[${
+								this.name
+							}]: :x: Error code: ${errorCode} while settling pnls for ${marketStr}:\n${
+								err.logs ? (err.logs as Array<string>).join('\n') : ''
+							}\n${err.stack ? err.stack : err.message}`
 						);
 					}
 				}
 			}
 		} catch (e) {
 			console.error(e);
-			webhookMessage(`[${this.name}]: :x: uncaught error:\n${e}\n${e.stack}`);
+			await webhookMessage(
+				`[${this.name}]: :x: uncaught error:\n${e.stack ? e.stack : e.messaage}`
+			);
 		} finally {
 			logger.info('Settle PNLs finished');
 			await this.watchdogTimerMutex.runExclusive(async () => {

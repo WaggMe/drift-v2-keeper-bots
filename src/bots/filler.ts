@@ -65,9 +65,9 @@ const CU_PER_FILL = 200_000; // CU cost for a successful fill
 const BURST_CU_PER_FILL = 350_000; // CU cost for a successful fill
 const MAX_CU_PER_TX = 1_400_000; // seems like this is all budget program gives us...on devnet
 const TX_COUNT_COOLDOWN_ON_BURST = 10; // send this many tx before resetting burst mode
-const FILL_ORDER_THROTTLE_BACKOFF = 5000; // the time to wait before trying to fill a throttled (error filling) node
+const FILL_ORDER_THROTTLE_BACKOFF = 10000; // the time to wait before trying to fill a throttled (error filling) node again
 const FILL_ORDER_COOLDOWN_BACKOFF = 2000; // the time to wait before trying to a node in the filling map again
-const USER_MAP_RESYNC_COOLDOWN_SLOTS = 300;
+const USER_MAP_RESYNC_COOLDOWN_SLOTS = 50;
 const dlobMutexError = new Error('dlobMutex timeout');
 
 enum METRIC_TYPES {
@@ -81,6 +81,7 @@ enum METRIC_TYPES {
 	attempted_fills = 'attempted_fills',
 	successful_fills = 'successful_fills',
 	observed_fills_count = 'observed_fills_count',
+	tx_sim_error_count = 'tx_sim_error_count',
 	user_map_user_account_keys = 'user_map_user_account_keys',
 	user_stats_map_authority_keys = 'user_stats_map_authority_keys',
 }
@@ -101,6 +102,7 @@ export class FillerBot implements Bot {
 	);
 	private dlob: DLOB;
 
+	private userMapMutex = new Mutex();
 	private userMap: UserMap;
 	private userStatsMap: UserStatsMap;
 
@@ -136,6 +138,7 @@ export class FillerBot implements Bot {
 	private attemptedFillsCounter: Counter;
 	private successfulFillsCounter: Counter;
 	private observedFillsCountCounter: Counter;
+	private txSimErrorCounter: Counter;
 	private userMapUserAccountKeysGauge: ObservableGauge;
 	private userStatsMapAuthorityKeysGauge: ObservableGauge;
 
@@ -258,6 +261,12 @@ export class FillerBot implements Bot {
 				description: 'Count of fills observed in the market',
 			}
 		);
+		this.txSimErrorCounter = this.meter.createCounter(
+			METRIC_TYPES.tx_sim_error_count,
+			{
+				description: 'Count of errors from simulating transactions',
+			}
+		);
 		this.userMapUserAccountKeysGauge = this.meter.createObservableGauge(
 			METRIC_TYPES.user_map_user_account_keys,
 			{
@@ -331,21 +340,20 @@ export class FillerBot implements Bot {
 	public async init() {
 		logger.info(`${this.name} initing`);
 
-		const initPromises: Array<Promise<any>> = [];
+		await this.userMapMutex.runExclusive(async () => {
+			this.userMap = new UserMap(
+				this.driftClient,
+				this.driftClient.userAccountSubscriptionConfig
+			);
+			this.userStatsMap = new UserStatsMap(
+				this.driftClient,
+				this.driftClient.userAccountSubscriptionConfig
+			);
 
-		this.userMap = new UserMap(
-			this.driftClient,
-			this.driftClient.userAccountSubscriptionConfig
-		);
-		initPromises.push(this.userMap.fetchAllUsers());
+			await this.userMap.fetchAllUsers();
+			await this.userStatsMap.fetchAllUserStats();
+		});
 
-		this.userStatsMap = new UserStatsMap(
-			this.driftClient,
-			this.driftClient.userAccountSubscriptionConfig
-		);
-		initPromises.push(this.userStatsMap.fetchAllUserStats());
-
-		await Promise.all(initPromises);
 		await webhookMessage(`[${this.name}]: started`);
 	}
 
@@ -364,12 +372,22 @@ export class FillerBot implements Bot {
 			healthy =
 				this.watchdogTimerLastPatTime > Date.now() - 5 * this.defaultIntervalMs;
 		});
+
+		const stateAccount = this.driftClient.getStateAccount();
+		const userMapResyncRequired =
+			this.userMap.size() !== stateAccount.numberOfSubAccounts.toNumber() ||
+			this.userStatsMap.size() !== stateAccount.numberOfAuthorities.toNumber();
+
+		healthy = healthy && !userMapResyncRequired;
+
 		return healthy;
 	}
 
 	public async trigger(record: WrappedEvent<any>) {
-		await this.userMap.updateWithEventRecord(record);
-		await this.userStatsMap.updateWithEventRecord(record, this.userMap);
+		await this.userMapMutex.runExclusive(async () => {
+			await this.userMap.updateWithEventRecord(record);
+			await this.userStatsMap.updateWithEventRecord(record, this.userMap);
+		});
 		logger.info(`filler seen record: ${record.eventType}`);
 
 		if (record.eventType === 'OrderRecord') {
@@ -426,13 +444,13 @@ export class FillerBot implements Bot {
 						}
 						return;
 					} else {
-						logger.info(`Resyncing UserMaps`);
 						doResync = true;
 						this.lastSlotResyncUserMaps = this.bulkAccountLoader.mostRecentSlot;
 					}
 				}
 
 				if (doResync) {
+					logger.info(`Resyncing UserMap`);
 					const newUserMap = new UserMap(
 						this.driftClient,
 						this.driftClient.userAccountSubscriptionConfig
@@ -444,11 +462,20 @@ export class FillerBot implements Bot {
 					newUserMap.fetchAllUsers().then(() => {
 						newUserStatsMap
 							.fetchAllUserStats()
-							.then(() => {
-								delete this.userMap;
-								delete this.userStatsMap;
-								this.userMap = newUserMap;
-								this.userStatsMap = newUserStatsMap;
+							.then(async () => {
+								await this.userMapMutex.runExclusive(async () => {
+									for (const user of this.userMap.values()) {
+										await user.unsubscribe();
+									}
+									for (const user of this.userStatsMap.values()) {
+										await user.unsubscribe();
+									}
+									delete this.userMap;
+									delete this.userStatsMap;
+
+									this.userMap = newUserMap;
+									this.userStatsMap = newUserStatsMap;
+								});
 							})
 							.finally(() => {
 								logger.info(`UserMaps resynced in ${Date.now() - start}ms`);
@@ -627,30 +654,36 @@ export class FillerBot implements Bot {
 		marketType: MarketType;
 	}> {
 		let makerInfo: MakerInfo | undefined;
-		if (nodeToFill.makerNode) {
-			const makerUserAccount = (
-				await this.userMap.mustGet(nodeToFill.makerNode.userAccount.toString())
-			).getUserAccount();
-			const makerAuthority = makerUserAccount.authority;
-			const makerUserStats = (
-				await this.userStatsMap.mustGet(makerAuthority.toString())
-			).userStatsAccountPublicKey;
-			makerInfo = {
-				maker: nodeToFill.makerNode.userAccount,
-				makerUserAccount: makerUserAccount,
-				order: nodeToFill.makerNode.order,
-				makerStats: makerUserStats,
-			};
-		}
+		let chUser: User;
+		let referrerInfo: ReferrerInfo;
+		await tryAcquire(this.userMapMutex).runExclusive(async () => {
+			if (nodeToFill.makerNode) {
+				const makerUserAccount = (
+					await this.userMap.mustGet(
+						nodeToFill.makerNode.userAccount.toString()
+					)
+				).getUserAccount();
+				const makerAuthority = makerUserAccount.authority;
+				const makerUserStats = (
+					await this.userStatsMap.mustGet(makerAuthority.toString())
+				).userStatsAccountPublicKey;
+				makerInfo = {
+					maker: nodeToFill.makerNode.userAccount,
+					makerUserAccount: makerUserAccount,
+					order: nodeToFill.makerNode.order,
+					makerStats: makerUserStats,
+				};
+			}
 
-		const chUser = await this.userMap.mustGet(
-			nodeToFill.node.userAccount.toString()
-		);
-		const referrerInfo = (
-			await this.userStatsMap.mustGet(
-				chUser.getUserAccount().authority.toString()
-			)
-		).getReferrerInfo();
+			chUser = await this.userMap.mustGet(
+				nodeToFill.node.userAccount.toString()
+			);
+			referrerInfo = (
+				await this.userStatsMap.mustGet(
+					chUser.getUserAccount().authority.toString()
+				)
+			).getReferrerInfo();
+		});
 
 		return Promise.resolve({
 			makerInfo,
@@ -707,8 +740,98 @@ export class FillerBot implements Bot {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 
-	private isLogFillOrder(log: string): boolean {
-		return log.includes('Instruction: FillPerpOrder');
+	private isIxLog(log: string): boolean {
+		const match = log.match(new RegExp('Program log: Instruction:'));
+
+		return match !== null;
+	}
+
+	private isEndIxLog(log: string): boolean {
+		const match = log.match(
+			new RegExp(
+				`Program ${this.driftClient.program.programId.toBase58()} consumed ([0-9]+) of ([0-9]+) compute units`
+			)
+		);
+
+		return match !== null;
+	}
+
+	private isFillIxLog(log: string): boolean {
+		const match = log.match(
+			new RegExp('Program log: Instruction: Fill(.*)Order')
+		);
+
+		return match !== null;
+	}
+
+	private isOrderDoesNotExistLog(log: string): number | null {
+		const match = log.match(new RegExp('.*Order does not exist ([0-9]+)'));
+
+		if (!match) {
+			return null;
+		}
+
+		return parseInt(match[1]);
+	}
+
+	private isMakerOrderDoesNotExistLog(log: string): number | null {
+		const match = log.match(new RegExp('.*Maker has no order id ([0-9]+)'));
+
+		if (!match) {
+			return null;
+		}
+
+		return parseInt(match[1]);
+	}
+
+	private isMakerFallbackLog(log: string): number | null {
+		const match = log.match(
+			new RegExp('.*Using fallback maker order id ([0-9]+)')
+		);
+
+		if (!match) {
+			return null;
+		}
+
+		return parseInt(match[1]);
+	}
+
+	private isMakerBreachedMaintenanceMarginLog(log: string): boolean {
+		const match = log.match(
+			new RegExp('.*maker breached maintenance requirements.*')
+		);
+
+		return match !== null;
+	}
+
+	private isTakerBreachedMaintenanceMarginLog(log: string): boolean {
+		const match = log.match(
+			new RegExp('.*taker breached maintenance requirements.*')
+		);
+
+		return match !== null;
+	}
+
+	private isErrFillingLog(log: string): [string, string] | null {
+		const match = log.match(
+			new RegExp('.*Err filling order id ([0-9]+) for user ([a-zA-Z0-9]+)')
+		);
+
+		if (!match) {
+			return null;
+		}
+
+		return [match[1], match[2]];
+	}
+
+	private isErrStaleOracle(log: string): boolean {
+		const match = log.match(new RegExp('.*Invalid Oracle: Stale.*'));
+
+		if (!match) {
+			return false;
+		}
+
+		return true;
 	}
 
 	/**
@@ -719,11 +842,12 @@ export class FillerBot implements Bot {
 	 *
 	 * @returns number of nodes successfully filled
 	 */
-	private handleTransactionLogs(
+	private async handleTransactionLogs(
 		nodesFilled: Array<NodeToFill>,
 		logs: string[]
-	): number {
-		let nextIsFillRecord = false;
+	): Promise<number> {
+		let inFillIx = false;
+		let errorThisFillIx = false;
 		let ixIdx = -1; // skip ComputeBudgetProgram
 		let successCount = 0;
 		let burstedCU = false;
@@ -739,106 +863,273 @@ export class FillerBot implements Bot {
 				this.useBurstCULimit = true;
 				this.fillTxSinceBurstCU = 0;
 				burstedCU = true;
+				continue;
 			}
 
-			if (nextIsFillRecord) {
-				if (log.includes('Order does not exist')) {
-					const filledNode = nodesFilled[ixIdx];
-					logger.error(
-						`   assoc order: ${filledNode.node.userAccount.toString()}, ${
-							filledNode.node.order.orderId
-						}`
-					);
-					logger.error(` ${log}, ixIdx: ${ixIdx}`);
-					this.throttledNodes.delete(this.getNodeToFillSignature(filledNode));
-					nextIsFillRecord = false;
-				} else if (log.includes('data')) {
-					// raw event data, this is expected
+			if (this.isEndIxLog(log)) {
+				if (!errorThisFillIx) {
 					successCount++;
-					nextIsFillRecord = false;
-				} else if (log.includes('Err filling order id')) {
-					const match = log.match(
-						new RegExp(
-							'.*Err filling order id ([0-9]+) for user ([a-zA-Z0-9]+)'
-						)
-					);
-					if (match !== null) {
-						const orderId = match[1];
-						const userAcc = match[2];
-						const extractedSig = this.getFillSignatureFromUserAccountAndOrderId(
-							userAcc,
-							orderId
-						);
-						this.throttledNodes.set(extractedSig, Date.now());
+				}
 
-						const filledNode = nodesFilled[ixIdx];
-						const assocNodeSig = this.getNodeToFillSignature(filledNode);
-						logger.warn(
-							`Throttling node due to fill error. extractedSig: ${extractedSig}, assocNodeSig: ${assocNodeSig}, assocNodeIdx: ${ixIdx}`
+				inFillIx = false;
+				errorThisFillIx = false;
+				continue;
+			}
+
+			if (this.isIxLog(log)) {
+				if (this.isFillIxLog(log)) {
+					inFillIx = true;
+					errorThisFillIx = false;
+					ixIdx++;
+
+					// can also print this from parsing the log record in upcoming
+					const nodeFilled = nodesFilled[ixIdx];
+					if (nodeFilled.makerNode) {
+						logger.info(
+							`Processing tx log for assoc node ${ixIdx}:\ntaker: ${nodeFilled.node.userAccount.toBase58()}-${
+								nodeFilled.node.order.orderId
+							} ${convertToNumber(
+								nodeFilled.node.order.baseAssetAmountFilled,
+								BASE_PRECISION
+							)}/${convertToNumber(
+								nodeFilled.node.order.baseAssetAmount,
+								BASE_PRECISION
+							)} @ ${convertToNumber(
+								nodeFilled.node.order.price,
+								PRICE_PRECISION
+							)}\nmaker: ${nodeFilled.makerNode.userAccount.toBase58()}-${
+								nodeFilled.makerNode.order.orderId
+							} ${convertToNumber(
+								nodeFilled.makerNode.order.baseAssetAmountFilled,
+								BASE_PRECISION
+							)}/${convertToNumber(
+								nodeFilled.makerNode.order.baseAssetAmount,
+								BASE_PRECISION
+							)} @ ${convertToNumber(
+								nodeFilled.makerNode.order.price,
+								PRICE_PRECISION
+							)}`
 						);
-						nextIsFillRecord = false;
 					} else {
-						logger.error(`Failed to find erroneous fill via regex: ${log}`);
+						logger.info(
+							`Processing tx log for assoc node ${ixIdx}:\ntaker: ${nodeFilled.node.userAccount.toBase58()}-${
+								nodeFilled.node.order.orderId
+							} ${convertToNumber(
+								nodeFilled.node.order.baseAssetAmountFilled,
+								BASE_PRECISION
+							)}/${convertToNumber(
+								nodeFilled.node.order.baseAssetAmount,
+								BASE_PRECISION
+							)} @ ${convertToNumber(
+								nodeFilled.node.order.price,
+								PRICE_PRECISION
+							)}\nmaker: vAMM`
+						);
 					}
 				} else {
-					const filledNode = nodesFilled[ixIdx];
-					logger.error(`how parse log?: ${log}`);
-					logger.error(
-						` assoc order: ${filledNode.node.userAccount.toString()}, ${
-							filledNode.node.order.orderId
-						}`
-					);
-					nextIsFillRecord = false;
+					inFillIx = false;
 				}
+				continue;
+			}
 
-				// nextIsFillRecord = false;
-			} else if (this.isLogFillOrder(log)) {
-				nextIsFillRecord = true;
-				ixIdx++;
+			if (!inFillIx) {
+				// this is not a log for a fill instruction
+				continue;
+			}
 
-				const nodeFilled = nodesFilled[ixIdx];
-				if (nodeFilled.makerNode) {
-					logger.info(
-						`Found filled tx:\ntaker: ${nodeFilled.node.userAccount.toBase58()}-${
-							nodeFilled.node.order.orderId
-						} ${convertToNumber(
-							nodeFilled.node.order.baseAssetAmountFilled,
-							BASE_PRECISION
-						)}/${convertToNumber(
-							nodeFilled.node.order.baseAssetAmount,
-							BASE_PRECISION
-						)} @ ${convertToNumber(
-							nodeFilled.node.order.price,
-							PRICE_PRECISION
-						)}\nmaker: ${nodeFilled.makerNode.userAccount.toBase58()}-${
-							nodeFilled.makerNode.order.orderId
-						} ${convertToNumber(
-							nodeFilled.makerNode.order.baseAssetAmountFilled,
-							BASE_PRECISION
-						)}/${convertToNumber(
-							nodeFilled.makerNode.order.baseAssetAmount,
-							BASE_PRECISION
-						)} @ ${convertToNumber(
-							nodeFilled.makerNode.order.price,
-							PRICE_PRECISION
+			// try to handle the log line
+			const orderIdDoesNotExist = this.isOrderDoesNotExistLog(log);
+			if (orderIdDoesNotExist) {
+				const filledNode = nodesFilled[ixIdx];
+				logger.error(
+					`assoc node (ixIdx: ${ixIdx}): ${filledNode.node.userAccount.toString()}, ${
+						filledNode.node.order.orderId
+					}; does not exist (filled by someone else); ${log}`
+				);
+				this.throttledNodes.delete(this.getNodeToFillSignature(filledNode));
+				errorThisFillIx = true;
+				continue;
+			}
+
+			const makerOrderIdDoesNotExist = this.isMakerOrderDoesNotExistLog(log);
+			if (makerOrderIdDoesNotExist) {
+				const filledNode = nodesFilled[ixIdx];
+				if (!filledNode.makerNode) {
+					logger.error(
+						`Got maker DNE error, but don't have a maker node: ${log}, ${ixIdx}\n${JSON.stringify(
+							filledNode,
+							null,
+							2
 						)}`
 					);
-				} else {
-					logger.info(
-						`Found filled tx:\ntaker: ${nodeFilled.node.userAccount.toBase58()}-${
-							nodeFilled.node.order.orderId
-						} ${convertToNumber(
-							nodeFilled.node.order.baseAssetAmountFilled,
-							BASE_PRECISION
-						)}/${convertToNumber(
-							nodeFilled.node.order.baseAssetAmount,
-							BASE_PRECISION
-						)} @ ${convertToNumber(
-							nodeFilled.node.order.price,
-							PRICE_PRECISION
-						)}\nmaker: vAMM`
+					continue;
+				}
+				const makerNodeSignature =
+					this.getFillSignatureFromUserAccountAndOrderId(
+						filledNode.makerNode.userAccount.toString(),
+						filledNode.makerNode.order.orderId.toString()
+					);
+				logger.error(
+					`maker assoc node (ixIdx: ${ixIdx}): ${filledNode.makerNode.userAccount.toString()}, ${
+						filledNode.makerNode.order.orderId
+					}; does not exist; throttling: ${makerNodeSignature}; ${log}`
+				);
+				this.throttledNodes.set(makerNodeSignature, Date.now());
+				continue;
+			}
+
+			const makerFallbackOrderId = this.isMakerFallbackLog(log);
+			if (makerFallbackOrderId) {
+				const filledNode = nodesFilled[ixIdx];
+				if (!filledNode.makerNode) {
+					logger.error(
+						`Got maker fallback log, but don't have a maker node: ${log}, ${ixIdx}\n${JSON.stringify(
+							filledNode,
+							null,
+							2
+						)}`
+					);
+					continue;
+				}
+				const makerNodeSignature =
+					this.getFillSignatureFromUserAccountAndOrderId(
+						filledNode.makerNode.userAccount.toString(),
+						makerFallbackOrderId.toString()
+					);
+				logger.error(
+					`maker fallback order assoc node (ixIdx: ${ixIdx}): ${filledNode.makerNode.userAccount.toString()}, ${
+						filledNode.makerNode.order.orderId
+					}; throttling ${makerNodeSignature}; ${log}`
+				);
+				this.throttledNodes.set(makerNodeSignature, Date.now());
+				continue;
+			}
+
+			const makerBreachedMaintenanceMargin =
+				this.isMakerBreachedMaintenanceMarginLog(log);
+			if (makerBreachedMaintenanceMargin) {
+				const filledNode = nodesFilled[ixIdx];
+				if (!filledNode.makerNode) {
+					logger.error(
+						`Got maker breached maint. margin log, but don't have a maker node: ${log}, ${ixIdx}\n${JSON.stringify(
+							filledNode,
+							null,
+							2
+						)}`
+					);
+					continue;
+				}
+				const makerNodeSignature =
+					this.getFillSignatureFromUserAccountAndOrderId(
+						filledNode.makerNode.userAccount.toString(),
+						makerFallbackOrderId.toString()
+					);
+				logger.error(
+					`maker breach maint. margin, assoc node (ixIdx: ${ixIdx}): ${filledNode.makerNode.userAccount.toString()}, ${
+						filledNode.makerNode.order.orderId
+					}; (throttling ${makerNodeSignature}); ${log}`
+				);
+				this.throttledNodes.set(makerNodeSignature, Date.now());
+				errorThisFillIx = true;
+				continue;
+			}
+
+			const takerBreachedMaintenanceMargin =
+				this.isTakerBreachedMaintenanceMarginLog(log);
+			if (takerBreachedMaintenanceMargin) {
+				const filledNode = nodesFilled[ixIdx];
+				const takerNodeSignature =
+					this.getFillSignatureFromUserAccountAndOrderId(
+						filledNode.node.userAccount.toString(),
+						filledNode.node.order.orderId.toString()
+					);
+				logger.error(
+					`taker breach maint. margin, assoc node (ixIdx: ${ixIdx}): ${filledNode.node.userAccount.toString()}, ${
+						filledNode.node.order.orderId
+					}; (throttling ${takerNodeSignature} and force cancelling orders); ${log}`
+				);
+				this.throttledNodes.set(takerNodeSignature, Date.now());
+				errorThisFillIx = true;
+
+				const tx = new Transaction();
+				tx.add(
+					ComputeBudgetProgram.requestUnits({
+						units: 1_000_000,
+						additionalFee: 0,
+					})
+				);
+				tx.add(
+					await this.driftClient.getForceCancelOrdersIx(
+						filledNode.node.userAccount,
+						(
+							await this.userMap.mustGet(filledNode.node.userAccount.toString())
+						).getUserAccount()
+					)
+				);
+				let makerIfExist = '';
+				if (filledNode.makerNode) {
+					makerIfExist = ` and maker ${filledNode.makerNode.userAccount.toBase58()}`;
+					tx.add(
+						await this.driftClient.getForceCancelOrdersIx(
+							filledNode.makerNode.userAccount,
+							(
+								await this.userMap.mustGet(
+									filledNode.makerNode.userAccount.toString()
+								)
+							).getUserAccount()
+						)
 					);
 				}
+
+				this.driftClient.txSender
+					.send(tx, [], this.driftClient.opts)
+					.then((txSig) => {
+						logger.info(
+							`Force cancelled orders for user ${filledNode.node.userAccount.toBase58()}${makerIfExist} due to breach of maintenance margin. Tx: ${txSig}`
+						);
+					})
+					.catch((e) => {
+						console.error(e);
+						logger.error(`Failed to send ForceCancelOrder Ixs (error above):`);
+						webhookMessage(
+							`[${this.name}]: :x: error processing fill tx logs:\n${
+								e.stack ? e.stack : e.message
+							}`
+						);
+					});
+
+				continue;
+			}
+
+			const errFillingLog = this.isErrFillingLog(log);
+			if (errFillingLog) {
+				const orderId = errFillingLog[0];
+				const userAcc = errFillingLog[1];
+				const extractedSig = this.getFillSignatureFromUserAccountAndOrderId(
+					userAcc,
+					orderId
+				);
+				this.throttledNodes.set(extractedSig, Date.now());
+
+				const filledNode = nodesFilled[ixIdx];
+				const assocNodeSig = this.getNodeToFillSignature(filledNode);
+				logger.warn(
+					`Throttling node due to fill error. extractedSig: ${extractedSig}, assocNodeSig: ${assocNodeSig}, assocNodeIdx: ${ixIdx}`
+				);
+				errorThisFillIx = true;
+				continue;
+			}
+
+			if (this.isErrStaleOracle(log)) {
+				logger.error(`Stale oracle error: ${log}`);
+				errorThisFillIx = true;
+				continue;
+			}
+
+			// probably some anchor log
+			if (log.length > 100) {
+				errorThisFillIx = true;
+				continue;
 			}
 		}
 
@@ -1106,21 +1397,28 @@ export class FillerBot implements Bot {
 						console.error(e);
 						logger.error(`Failed to process fill tx logs (error above):`);
 						webhookMessage(
-							`[${this.name}]: :x: error processing fill tx logs:\n${e}`
+							`[${this.name}]: :x: error processing fill tx logs:\n${
+								e.stack ? e.stack : e.message
+							}`
 						);
 					});
 			})
-			.catch((e) => {
+			.catch(async (e) => {
 				console.error(e);
 				logger.error(`Failed to send packed tx (error above):`);
 				const simError = e as SendTransactionError;
-				if (simError.logs) {
+				if (simError.logs && simError.logs.length > 0) {
+					this.txSimErrorCounter.add(1);
 					const start = Date.now();
-					this.handleTransactionLogs(nodesSent, simError.logs);
+					await this.handleTransactionLogs(nodesSent, simError.logs);
 					logger.error(
 						`Failed to send tx, sim error tx logs took: ${Date.now() - start}ms`
 					);
-					webhookMessage(`[${this.name}]: :x: error simulating tx:\n${e}`);
+					webhookMessage(
+						`[${this.name}]: :x: error simulating tx:\n${
+							simError.logs ? simError.logs.join('\n') : ''
+						}\n${e.stack || e}`
+					);
 				}
 			})
 			.finally(() => {
@@ -1141,7 +1439,9 @@ export class FillerBot implements Bot {
 						delete this.dlob;
 					}
 					this.dlob = new DLOB();
-					await this.dlob.initFromUserMap(this.userMap);
+					await tryAcquire(this.userMapMutex).runExclusive(async () => {
+						await this.dlob.initFromUserMap(this.userMap);
+					});
 					if (orderRecord) {
 						this.dlob.insertOrder(orderRecord.order, orderRecord.user);
 					}
@@ -1152,12 +1452,22 @@ export class FillerBot implements Bot {
 				// 1) get all fillable nodes
 				let fillableNodes: Array<NodeToFill> = [];
 				for (const market of this.driftClient.getPerpMarketAccounts()) {
-					fillableNodes = fillableNodes.concat(
-						await this.getPerpFillableNodesForMarket(market)
-					);
-					logger.debug(
-						`got ${fillableNodes.length} fillable nodes on market ${market.marketIndex}`
-					);
+					try {
+						fillableNodes = fillableNodes.concat(
+							await this.getPerpFillableNodesForMarket(market)
+						);
+						logger.debug(
+							`got ${fillableNodes.length} fillable nodes on market ${market.marketIndex}`
+						);
+					} catch (e) {
+						console.error(e);
+						webhookMessage(
+							`[${this.name}]: :x: Failed to get fillable nodes for market ${
+								market.marketIndex
+							}:\n${e.stack ? e.stack : e.message}`
+						);
+						continue;
+					}
 				}
 
 				// filter out nodes that we know cannot be filled
@@ -1208,7 +1518,11 @@ export class FillerBot implements Bot {
 			} else if (e === dlobMutexError) {
 				logger.error(`${this.name} dlobMutexError timeout`);
 			} else {
-				webhookMessage(`[${this.name}]: :x: uncaught error:\n${e}\n${e.stack}`);
+				webhookMessage(
+					`[${this.name}]: :x: uncaught error:\n${
+						e.stack ? e.stack : e.message
+					}`
+				);
 				throw e;
 			}
 		} finally {
