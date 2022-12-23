@@ -1124,7 +1124,9 @@ export class FillerBot implements Bot {
 						console.error(e);
 						logger.error(`Failed to process fill tx logs (error above):`);
 						webhookMessage(
-							`[${this.name}]: :x: error processing fill tx logs:\n${e}`
+							`[${this.name}]: :x: error processing fill tx logs:\n${
+								e.stack ? e.stack : e.message
+							}`
 							,WEBHOOK_URL_FILLER
 						);
 					});
@@ -1140,7 +1142,9 @@ export class FillerBot implements Bot {
 						`Failed to send tx, sim error tx logs took: ${Date.now() - start}ms`
 					);
 					webhookMessage(
-						`[${this.name}]: :x: error simulating tx:\n${e}`
+						`[${this.name}]: :x: error simulating tx:\n${
+							e.stack ? e.stack : e.message
+						}`
 						,WEBHOOK_URL_FILLER
 					);
 				}
@@ -1231,7 +1235,9 @@ export class FillerBot implements Bot {
 				logger.error(`${this.name} dlobMutexError timeout`);
 			} else {
 				webhookMessage(
-					`[${this.name}]: :x: uncaught error:\n${e}\n${e.stack}`
+					`[${this.name}]: :x: uncaught error:\n${
+						e.stack ? e.stack : e.message
+					}`
 					,WEBHOOK_URL_FILLER
 				);
 				throw e;
