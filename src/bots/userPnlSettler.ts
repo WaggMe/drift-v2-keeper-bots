@@ -14,6 +14,8 @@ import {
 	OrderRecord,
 	UserMap,
 	ZERO,
+	calculateNetUserPnlImbalance,
+	convertToNumber,
 } from '@drift-labs/sdk';
 import { Mutex } from 'async-mutex';
 
@@ -80,6 +82,9 @@ export class UserPnlSettlerBot implements Bot {
 			clearInterval(intervalId);
 		}
 		this.intervalIds = [];
+		for (const user of this.userMap.values()) {
+			await user.unsubscribe();
+		}
 		delete this.userMap;
 	}
 
@@ -175,6 +180,26 @@ export class UserPnlSettlerBot implements Bot {
 						continue;
 					}
 
+					if (unsettledPnl.gt(ZERO)) {
+						const pnlImbalance = calculateNetUserPnlImbalance(
+							perpMarketAndOracleData[marketIndexNum].marketAccount,
+							spotMarketAndOracleData[0].marketAccount,
+							perpMarketAndOracleData[marketIndexNum].oraclePriceData
+						).mul(new BN(-1));
+
+						if (pnlImbalance.lte(ZERO)) {
+							logger.warn(
+								`Want to settle positive PnL for user ${user
+									.getUserAccountPublicKey()
+									.toBase58()} in market ${marketIndexNum}, but there is a pnl imbalance (${convertToNumber(
+									pnlImbalance,
+									QUOTE_PRECISION
+								)})`
+							);
+							continue;
+						}
+					}
+
 					// only settle user pnl if they have enough collateral
 					if (
 						user.getTotalCollateral().lt(user.getMaintenanceMarginRequirement())
@@ -251,7 +276,7 @@ export class UserPnlSettlerBot implements Bot {
 							`[${
 								this.name
 							}]: :x: Error code: ${errorCode} while settling pnls for ${marketStr}:\n${
-								err.logs || ''
+								err.logs ? (err.logs as Array<string>).join('\n') : ''
 							}\n${err.stack ? err.stack : err.message}`
 						);
 					}

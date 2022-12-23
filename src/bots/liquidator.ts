@@ -54,7 +54,7 @@ require('dotenv').config();
 const WEBHOOK_URL_LIQUIDATOR = process.env.WEBHOOK_URL_LIQUIDATOR;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-const USER_MAP_RESYNC_COOLDOWN_SLOTS = 300;
+const USER_MAP_RESYNC_COOLDOWN_SLOTS = 50;
 
 function calculateSpotTokenAmountToLiquidate(
 	driftClient: DriftClient,
@@ -213,7 +213,9 @@ async function liqPerpPnl(
 							this.name
 						}]: :x: error in liquidateBorrowForPerpPnl for ${user.userAccountPublicKey.toBase58()} on market ${
 							liquidateePosition.marketIndex
-						} :\n${e.stack ? e.stack : e.message}`
+						}:\n${e.logs ? (e.logs as Array<string>).join('\n') : ''}\n${
+							e.stack ? e.stack : e.message
+						}`
 						,WEBHOOK_URL_LIQUIDATOR
 					);
 				})
@@ -261,7 +263,9 @@ async function liqPerpPnl(
 						this.name
 					}]: :x: error in liquidatePerpPnlForDeposit for ${user.userAccountPublicKey.toBase58()} on market ${
 						liquidateePosition.marketIndex
-					} :\n${e.stack ? e.stack : e.message}`
+					}:\n${e.logs ? (e.logs as Array<string>).join('\n') : ''}\n${
+						e.stack ? e.stack : e.message
+					}`
 					,WEBHOOK_URL_LIQUIDATOR
 				);
 			})
@@ -307,6 +311,7 @@ export class LiquidatorBot implements Bot {
 	private metricsPort: number | undefined;
 	private meter: Meter;
 	private exporter: PrometheusExporter;
+	private bootTimeMs: number;
 
 	// metrics
 	private runtimeSpecsGauge: ObservableGauge;
@@ -326,6 +331,7 @@ export class LiquidatorBot implements Bot {
 	private bulkAccountLoader: BulkAccountLoader | undefined;
 	private driftClient: DriftClient;
 	private intervalIds: Array<NodeJS.Timer> = [];
+	private userMapMutex = new Mutex();
 	private userMap: UserMap;
 	private deriskMutex = new Uint8Array(new SharedArrayBuffer(1));
 	private runtimeSpecs: RuntimeSpec;
@@ -364,6 +370,7 @@ export class LiquidatorBot implements Bot {
 		this.serumFulfillmentConfigMap = new SerumFulfillmentConfigMap(
 			this.driftClient
 		);
+		this.bootTimeMs = Date.now();
 
 		this.metricsPort = metricsPort;
 		if (this.metricsPort) {
@@ -374,10 +381,13 @@ export class LiquidatorBot implements Bot {
 	public async init() {
 		logger.info(`${this.name} initing`);
 		// initialize userMap instance
-		this.userMap = new UserMap(
-			this.driftClient,
-			this.driftClient.userAccountSubscriptionConfig
-		);
+		await this.userMapMutex.runExclusive(async () => {
+			this.userMap = new UserMap(
+				this.driftClient,
+				this.driftClient.userAccountSubscriptionConfig
+			);
+			await this.userMap.fetchAllUsers();
+		});
 
 		const config = initialize({ env: this.runtimeSpecs.driftEnv as DriftEnv });
 		for (const spotMarketConfig of config.SPOT_MARKETS) {
@@ -390,7 +400,6 @@ export class LiquidatorBot implements Bot {
 			}
 		}
 
-		await this.userMap.fetchAllUsers();
 		await webhookMessage(`[${this.name}]: started`,WEBHOOK_URL);
 	}
 
@@ -399,11 +408,18 @@ export class LiquidatorBot implements Bot {
 			clearInterval(intervalId);
 		}
 		this.intervalIds = [];
-		delete this.userMap;
+		await this.userMapMutex.runExclusive(async () => {
+			for (const user of this.userMap.values()) {
+				await user.unsubscribe();
+			}
+			delete this.userMap;
+		});
 	}
 
 	public async trigger(record: WrappedEvent<any>) {
-		await this.userMap.updateWithEventRecord(record);
+		await this.userMapMutex.runExclusive(async () => {
+			await this.userMap.updateWithEventRecord(record);
+		});
 	}
 
 	/**
@@ -434,22 +450,27 @@ export class LiquidatorBot implements Bot {
 						}
 						return;
 					} else {
-						logger.info(`Resyncing UserMaps`);
 						doResync = true;
 						this.lastSlotResyncUserMaps = this.bulkAccountLoader.mostRecentSlot;
 					}
 				}
 
 				if (doResync) {
+					logger.info(`Resyncing UserMap`);
 					const newUserMap = new UserMap(
 						this.driftClient,
 						this.driftClient.userAccountSubscriptionConfig
 					);
 					newUserMap
 						.fetchAllUsers()
-						.then(() => {
-							delete this.userMap;
-							this.userMap = newUserMap;
+						.then(async () => {
+							await this.userMapMutex.runExclusive(async () => {
+								for (const user of this.userMap.values()) {
+									await user.unsubscribe();
+								}
+								delete this.userMap;
+								this.userMap = newUserMap;
+							});
 						})
 						.finally(() => {
 							logger.info(`UserMaps resynced in ${Date.now() - start}ms`);
@@ -490,6 +511,13 @@ export class LiquidatorBot implements Bot {
 			healthy =
 				this.watchdogTimerLastPatTime > Date.now() - 2 * this.defaultIntervalMs;
 		});
+
+		const stateAccount = this.driftClient.getStateAccount();
+		const userMapResyncRequired =
+			this.userMap.size() !== stateAccount.numberOfSubAccounts.toNumber();
+
+		healthy = healthy && !userMapResyncRequired;
+
 		return healthy;
 	}
 
@@ -925,174 +953,193 @@ export class LiquidatorBot implements Bot {
 		try {
 			await this.resyncUserMapsIfRequired();
 
-			for (const user of this.userMap.values()) {
-				const userAcc = user.getUserAccount();
-				const auth = userAcc.authority.toBase58();
-				const userKey = user.userAccountPublicKey.toBase58();
+			await this.userMapMutex.runExclusive(async () => {
+				for (const user of this.userMap.values()) {
+					const userAcc = user.getUserAccount();
+					const auth = userAcc.authority.toBase58();
+					const userKey = user.userAccountPublicKey.toBase58();
 
-				if (isVariant(userAcc.status, 'bankrupt')) {
-					await this.tryResolveBankruptUser(user);
-				} else if (user.canBeLiquidated()) {
-					logger.info(`liquidating ${auth}: ${userKey}...`);
-					webhookMessage(
-						`[${this.name}]: liquidating ${auth}: ${userKey} ...`
+					if (isVariant(userAcc.status, 'bankrupt')) {
+						await this.tryResolveBankruptUser(user);
+					} else if (user.canBeLiquidated()) {
+						logger.info(`liquidating ${auth}: ${userKey}...`);
+						webhookMessage(
+						
+							`[${this.name}]: liquidating ${auth}: ${userKey} ...`
 						,WEBHOOK_URL_LIQUIDATOR
-					);
-
-					const liquidatorUser = this.driftClient.getUser();
-					const liquidateeUserAccount = user.getUserAccount();
-
-					// most attractive spot market liq
-					const [depositMarketIndextoLiq, depositAmountToLiq] =
-						findBestSpotPosition(
-							this.driftClient,
-							liquidatorUser,
-							liquidateeUserAccount.spotPositions,
-							false,
-							this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL,
-							this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM
+					
 						);
 
-					const [borrowMarketIndextoLiq, borrowAmountToLiq] =
-						findBestSpotPosition(
-							this.driftClient,
-							liquidatorUser,
-							liquidateeUserAccount.spotPositions,
-							true,
-							this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL,
-							this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM
-						);
+						const liquidatorUser = this.driftClient.getUser();
+						const liquidateeUserAccount = user.getUserAccount();
 
-					if (borrowMarketIndextoLiq != -1 && depositMarketIndextoLiq != -1) {
-						//const start = Date.now();
-						this.driftClient
-							.liquidateSpot(
-								user.userAccountPublicKey,
-								user.getUserAccount(),
-								depositMarketIndextoLiq,
-								borrowMarketIndextoLiq,
-								borrowAmountToLiq
-							)
-							.then((tx) => {
-								logger.info(
-									`liquidateSpot user=${user.userAccountPublicKey.toString()}
-								(deposit_index=${depositMarketIndextoLiq} for borrow_index=${borrowMarketIndextoLiq}
-								maxBorrowAmount=${borrowAmountToLiq.toString()})
-								tx: ${tx}`
-								);
-								webhookMessage(
-									`[${
-										this.name
-									}]: liquidateSpot user=${user.userAccountPublicKey.toString()}
+						// most attractive spot market liq
+						const [depositMarketIndextoLiq, depositAmountToLiq] =
+							findBestSpotPosition(
+								this.driftClient,
+								liquidatorUser,
+								liquidateeUserAccount.spotPositions,
+								false,
+								this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL,
+								this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM
+							);
+
+						const [borrowMarketIndextoLiq, borrowAmountToLiq] =
+							findBestSpotPosition(
+								this.driftClient,
+								liquidatorUser,
+								liquidateeUserAccount.spotPositions,
+								true,
+								this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL,
+								this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM
+							);
+
+						if (borrowMarketIndextoLiq != -1 && depositMarketIndextoLiq != -1) {
+							//const start = Date.now();
+							this.driftClient
+								.liquidateSpot(
+									user.userAccountPublicKey,
+									user.getUserAccount(),
+									depositMarketIndextoLiq,
+									borrowMarketIndextoLiq,
+									borrowAmountToLiq
+								)
+								.then((tx) => {
+									logger.info(
+										`liquidateSpot user=${user.userAccountPublicKey.toString()}
 									(deposit_index=${depositMarketIndextoLiq} for borrow_index=${borrowMarketIndextoLiq}
 									maxBorrowAmount=${borrowAmountToLiq.toString()})
 									tx: ${tx}`
-									,WEBHOOK_URL_LIQUIDATOR
-								);
-							})
-							.catch((e) => {
-								logger.error(
-									`Error in liquidateSpot for user ${user.userAccountPublicKey.toBase58()} on market ${depositMarketIndextoLiq} for borrow index: ${borrowMarketIndextoLiq}`
-								);
-								logger.error(e);
-								webhookMessage(
-									`[${
-										this.name
-									}]: :x: Error in liquidateSpot for user ${user.userAccountPublicKey.toBase58()} on market ${depositMarketIndextoLiq} for borrow index: ${borrowMarketIndextoLiq}:\n${
-										e.stack ? e.stack : e.message
-									}`
-                  ,WEBHOOK_URL_LIQUIDATOR
-								);
-							})
-							/*.finally(() => {
-								this.sdkCallDurationHistogram.record(Date.now() - start, {
-									method: 'liquidateSpot',
-								});
-							})*/;
-					}
-
-					const usdcMarket = this.driftClient.getSpotMarketAccount(
-						QUOTE_SPOT_MARKET_INDEX
-					);
-
-					// less attractive, perp / perp pnl liquidations
-					for (const liquidateePosition of liquidateeUserAccount.perpPositions) {
-						if (liquidateePosition.baseAssetAmount.isZero()) {
-							if (!liquidateePosition.quoteAssetAmount.isZero()) {
-								const perpMarket = this.driftClient.getPerpMarketAccount(
-									liquidateePosition.marketIndex
-								);
-								await liqPerpPnl(
-									this.driftClient,
-									user,
-									perpMarket,
-									usdcMarket,
-									this.sdkCallDurationHistogram,
-									liquidateePosition,
-									depositMarketIndextoLiq,
-									depositAmountToLiq,
-									borrowMarketIndextoLiq,
-									borrowAmountToLiq
-								);
-
-								break; // todo: exit loop to reload accounts etc?
-							}
-							continue;
-						}
-
-						const baseAmountToLiquidate = this.calculateBaseAmountToLiquidate(
-							liquidatorUser,
-							liquidateePosition
-						);
-
-						if (baseAmountToLiquidate.gt(ZERO)) {
-							if (this.dryRun) {
-								logger.warn(
-									'--dry run flag enabled - not sending liquidate tx'
-								);
-							}
-							//const start = Date.now();
-							this.driftClient
-								.liquidatePerp(
-									user.userAccountPublicKey,
-									user.getUserAccount(),
-									liquidateePosition.marketIndex,
-									baseAmountToLiquidate
-								)
-								.then((tx) => {
-									logger.info(`liquidatePerp tx: ${tx}`);
+									);
 									webhookMessage(
 										`[${
 											this.name
-										}]: liquidatePerp for ${user.userAccountPublicKey.toBase58()} on market ${
-											liquidateePosition.marketIndex
-										} tx: ${tx}`
-										,WEBHOOK_URL_LIQUIDATOR
+										}]: liquidateSpot user=${user.userAccountPublicKey.toString()}
+										(deposit_index=${depositMarketIndextoLiq} for borrow_index=${borrowMarketIndextoLiq}
+										maxBorrowAmount=${borrowAmountToLiq.toString()})
+										tx: ${tx}`
+									,WEBHOOK_URL_LIQUIDATOR
 									);
 								})
 								.catch((e) => {
 									logger.error(
-										`Error liquidating auth: ${auth}, user: ${userKey} on market ${liquidateePosition.marketIndex}`
+										`Error in liquidateSpot for user ${user.userAccountPublicKey.toBase58()} on market ${depositMarketIndextoLiq} for borrow index: ${borrowMarketIndextoLiq}`
 									);
-									console.error(e);
+									logger.error(e);
 									webhookMessage(
 										`[${
 											this.name
-										}]: :x: Error liquidating auth: ${auth}, user: ${userKey} on market ${
-											liquidateePosition.marketIndex
-										}\n${e.stack || e}}`
-                    ,WEBHOOK_URL_LIQUIDATOR
+										}]: :x: Error in liquidateSpot for user ${user.userAccountPublicKey.toBase58()} on market ${depositMarketIndextoLiq} for borrow index: ${borrowMarketIndextoLiq}:\n${
+											e.logs ? (e.logs as Array<string>).join('\n') : ''
+										}\n${e.stack ? e.stack : e.message}`
+                  ,WEBHOOK_URL_LIQUIDATOR
 									);
 								})
 								/*.finally(() => {
 									this.sdkCallDurationHistogram.record(Date.now() - start, {
-										method: 'liquidatePerp',
+										method: 'liquidateSpot',
 									});
 								})*/;
 						}
+
+						const usdcMarket = this.driftClient.getSpotMarketAccount(
+							QUOTE_SPOT_MARKET_INDEX
+						);
+
+						// less attractive, perp / perp pnl liquidations
+						for (const liquidateePosition of liquidateeUserAccount.perpPositions) {
+							if (liquidateePosition.baseAssetAmount.isZero()) {
+								if (!liquidateePosition.quoteAssetAmount.isZero()) {
+									const perpMarket = this.driftClient.getPerpMarketAccount(
+										liquidateePosition.marketIndex
+									);
+									await liqPerpPnl(
+										this.driftClient,
+										user,
+										perpMarket,
+										usdcMarket,
+										this.sdkCallDurationHistogram,
+										liquidateePosition,
+										depositMarketIndextoLiq,
+										depositAmountToLiq,
+										borrowMarketIndextoLiq,
+										borrowAmountToLiq
+									);
+
+									break; // todo: exit loop to reload accounts etc?
+								}
+								continue;
+							}
+
+							const baseAmountToLiquidate = this.calculateBaseAmountToLiquidate(
+								liquidatorUser,
+								liquidateePosition
+							);
+
+							if (baseAmountToLiquidate.gt(ZERO)) {
+								if (this.dryRun) {
+									logger.warn(
+										'--dry run flag enabled - not sending liquidate tx'
+									);
+								}
+								//const start = Date.now();
+								this.driftClient
+									.liquidatePerp(
+										user.userAccountPublicKey,
+										user.getUserAccount(),
+										liquidateePosition.marketIndex,
+										baseAmountToLiquidate
+									)
+									.then((tx) => {
+										logger.info(`liquidatePerp tx: ${tx}`);
+										webhookMessage(
+											`[${
+												this.name
+											}]: liquidatePerp for ${user.userAccountPublicKey.toBase58()} on market ${
+												liquidateePosition.marketIndex
+											} tx: ${tx}`
+										,WEBHOOK_URL_LIQUIDATOR
+										);
+									})
+									.catch((e) => {
+										logger.error(
+											`Error liquidating auth: ${auth}, user: ${userKey} on market ${liquidateePosition.marketIndex}`
+										);
+										console.error(e);
+										webhookMessage(
+											`[${
+												this.name
+											}]: :x: Error liquidating auth: ${auth}, user: ${userKey} on market ${
+												liquidateePosition.marketIndex
+											}\n${
+												e.logs ? (e.logs as Array<string>).join('\n') : ''
+											}\n${e.stack || e}}`
+                    ,WEBHOOK_URL_LIQUIDATOR
+										);
+									})
+									/*.finally(() => {
+										this.sdkCallDurationHistogram.record(Date.now() - start, {
+											method: 'liquidatePerp',
+										});
+									})*/;
+							}
+						}
+					} else if (isVariant(userAcc.status, 'beingLiquidated')) {
+						// no-op to clear user of beingLiquidated status
+						logger.info(
+							`[${
+								this.name
+							}]: user stuck in beingLiquidated status, clearing it for ${user.userAccountPublicKey.toBase58()}`
+						);
+						this.driftClient.liquidatePerp(
+							user.userAccountPublicKey,
+							user.getUserAccount(),
+							0,
+							ZERO
+						);
 					}
 				}
-			}
+			});
 			await this.derisk();
 			ran = true;
 		} catch (e) {
