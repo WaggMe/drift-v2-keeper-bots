@@ -501,6 +501,17 @@ export class LiquidatorBot implements Bot {
 				100.0
 			}% per liquidation`
 		);
+		webhookMessage(
+			`${this.name} free collateral: $${convertToNumber(
+				freeCollateral,
+				QUOTE_PRECISION
+			)}, spending at most ${
+				(this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL.toNumber() /
+					this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM.toNumber()) *
+				100.0
+			}% per liquidation`
+			,WEBHOOK_URL
+		);
 	}
 
 	public async healthCheck(): Promise<boolean> {
