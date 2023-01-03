@@ -25,7 +25,13 @@ import {
 	BASE_PRECISION,
 	PRICE_PRECISION,
 } from '@drift-labs/sdk';
-import { Mutex, tryAcquire, withTimeout, E_ALREADY_LOCKED } from 'async-mutex';
+import {
+	Mutex,
+	tryAcquire,
+	withTimeout,
+	E_ALREADY_LOCKED,
+	MutexInterface,
+} from 'async-mutex';
 
 import { PublicKey } from '@solana/web3.js';
 
@@ -82,16 +88,13 @@ enum METRIC_TYPES {
 export class SpotFillerBot implements Bot {
 	public readonly name: string;
 	public readonly dryRun: boolean;
-	public readonly defaultIntervalMs: number = 1000;
+	public readonly defaultIntervalMs: number = 5000;
 
 	private bulkAccountLoader: BulkAccountLoader | undefined;
 	private driftClient: DriftClient;
+	private pollingIntervalMs: number;
 
-	private dlobMutex = withTimeout(
-		new Mutex(),
-		10 * this.defaultIntervalMs,
-		dlobMutexError
-	);
+	private dlobMutex: MutexInterface;
 	private dlob: DLOB;
 
 	private userMapMutex = new Mutex();
@@ -137,8 +140,14 @@ export class SpotFillerBot implements Bot {
 		bulkAccountLoader: BulkAccountLoader | undefined,
 		clearingHouse: DriftClient,
 		runtimeSpec: RuntimeSpec,
-		metricsPort?: number | undefined
+		pollingIntervalMs?: number,
+		metricsPort?: number
 	) {
+		if (!bulkAccountLoader) {
+			throw new Error(
+				'SpotFiller only works in polling mode (cannot run with --websocket flag) bulkAccountLoader is required'
+			);
+		}
 		this.name = name;
 		this.dryRun = dryRun;
 		this.bulkAccountLoader = bulkAccountLoader;
@@ -149,6 +158,16 @@ export class SpotFillerBot implements Bot {
 			clearingHouse
 		);
 		this.serumSubscribers = new Map<number, SerumSubscriber>();
+
+		if (!pollingIntervalMs) {
+			pollingIntervalMs = this.defaultIntervalMs;
+		}
+		this.pollingIntervalMs = pollingIntervalMs;
+		this.dlobMutex = withTimeout(
+			new Mutex(),
+			10 * this.pollingIntervalMs,
+			dlobMutexError
+		);
 
 		this.metricsPort = metricsPort;
 		if (this.metricsPort) {
@@ -349,8 +368,11 @@ export class SpotFillerBot implements Bot {
 
 	public async reset() {}
 
-	public async startIntervalLoop(intervalMs: number) {
-		const intervalId = setInterval(this.trySpotFill.bind(this), intervalMs);
+	public async startIntervalLoop(_intervalMs: number) {
+		const intervalId = setInterval(
+			this.trySpotFill.bind(this),
+			this.pollingIntervalMs
+		);
 		this.intervalIds.push(intervalId);
 
 		logger.info(`${this.name} Bot started!`);
@@ -360,7 +382,7 @@ export class SpotFillerBot implements Bot {
 		let healthy = false;
 		await this.watchdogTimerMutex.runExclusive(async () => {
 			healthy =
-				this.watchdogTimerLastPatTime > Date.now() - 2 * this.defaultIntervalMs;
+				this.watchdogTimerLastPatTime > Date.now() - 5 * this.pollingIntervalMs;
 			if (!healthy) {
 				logger.warn(`${this.name} watchdog timer expired`);
 			}
@@ -680,8 +702,8 @@ export class SpotFillerBot implements Bot {
 				});*/
 			})
 			.catch((e) => {
+				logger.error(`Failed to fill spot order:`);
 				console.error(e);
-				logger.error(`Failed to fill spot order`);
 				webhookMessage(
 					`[${this.name}]: :x: error trying to fill spot orders:\n${
 						e.logs ? (e.logs as Array<string>).join('\n') : ''
@@ -762,7 +784,7 @@ export class SpotFillerBot implements Bot {
 			} else if (e === dlobMutexError) {
 				logger.error(`${this.name} dlobMutexError timeout`);
 			} else {
-				console.log('some other error...');
+				logger.error('some other error:');
 				console.error(e);
 				webhookMessage(
 					`[${this.name}]: :x: error trying to run main loop:\n${

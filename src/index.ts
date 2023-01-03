@@ -28,6 +28,8 @@ import {
 	BASE_PRECISION,
 	getSignedTokenAmount,
 	TokenFaucet,
+	DriftClientSubscriptionConfig,
+	LogProviderConfig,
 } from '@drift-labs/sdk';
 import { promiseTimeout } from '@drift-labs/sdk/lib/util/promiseTimeout';
 import { Mutex } from 'async-mutex';
@@ -63,6 +65,20 @@ const metricsPort =
 	process.env.METRICS_PORT ||
 	PrometheusExporter.DEFAULT_OPTIONS.port.toString();
 
+const bulkAccountLoaderPollingInterval = process.env
+	.BULK_ACCOUNT_LOADER_POLLING_INTERVAL
+	? parseInt(process.env.BULK_ACCOUNT_LOADER_POLLING_INTERVAL)
+	: 5000;
+const eventSubscriberPollingInterval = process.env
+	.EVENT_SUBSCRIBER_POLLING_INTERVAL
+	? parseInt(process.env.EVENT_SUBSCRIBER_POLLING_INTERVAL)
+	: 5000;
+
+// TODO: do these bot specific configs better
+const fillerPollingInterval = process.env.FILLER_POLLING_INTERVAL
+	? parseInt(process.env.FILLER_POLLING_INTERVAL)
+	: 6000;
+
 program
 	.option('-d, --dry-run', 'Dry run, do not send transactions on chain')
 	.option(
@@ -96,6 +112,10 @@ program
 		'--run-once',
 		'Exit after running bot loops once (only for supported bots)'
 	)
+	.option(
+		'--websocket',
+		'Use websocket instead of RPC polling for account updates'
+	)
 	.parse();
 
 const opts = program.opts();
@@ -109,6 +129,13 @@ JitMakerBot enabled: ${!!opts.jitMaker},\n\
 IFRevenueSettler enabled: ${!!opts.ifRevenueSettler},\n\
 userPnlSettler enabled: ${!!opts.userPnlSettler},\n\
 `);
+
+logger.info(
+	`BulkAccountLoader polling interval: ${bulkAccountLoaderPollingInterval}ms`
+);
+logger.info(
+	`EventSubscriber polling interval:   ${eventSubscriberPollingInterval}ms`
+);
 
 export function getWallet(): Wallet {
 	const privateKey = process.env.KEEPER_PRIVATE_KEY;
@@ -246,15 +273,33 @@ const runBot = async () => {
 
 	const connection = new Connection(endpoint, stateCommitment);
 
-	const bulkAccountLoader = new BulkAccountLoader(
-		connection,
-		stateCommitment,
-		1000
-	);
-	let lastBulkAccountLoaderSlot = bulkAccountLoader.mostRecentSlot;
+	let bulkAccountLoader: BulkAccountLoader | undefined;
+	let lastBulkAccountLoaderSlot: number | undefined;
+	let accountSubscription: DriftClientSubscriptionConfig = {
+		type: 'websocket',
+	};
+	let logProviderConfig: LogProviderConfig = {
+		type: 'websocket',
+	};
 
-	// const bulkAccountLoader = undefined;
-	// let lastBulkAccountLoaderSlot = undefined;
+	if (!opts.websocket) {
+		bulkAccountLoader = new BulkAccountLoader(
+			connection,
+			stateCommitment,
+			bulkAccountLoaderPollingInterval
+		);
+		lastBulkAccountLoaderSlot = bulkAccountLoader.mostRecentSlot;
+		accountSubscription = {
+			type: 'polling',
+			accountLoader: bulkAccountLoader,
+		};
+
+		logProviderConfig = {
+			type: 'polling',
+			frequency: eventSubscriberPollingInterval,
+		};
+	}
+
 	const driftClient = new DriftClient({
 		connection,
 		wallet,
@@ -264,11 +309,7 @@ const runBot = async () => {
 		oracleInfos: PerpMarkets[driftEnv].map((mkt) => {
 			return { publicKey: mkt.oracle, source: mkt.oracleSource };
 		}),
-		accountSubscription: {
-			// type: 'websocket'
-			type: 'polling',
-			accountLoader: bulkAccountLoader,
-		},
+		accountSubscription,
 		env: driftEnv,
 		userStats: true,
 	});
@@ -279,11 +320,7 @@ const runBot = async () => {
 		orderBy: 'blockchain',
 		orderDir: 'desc',
 		commitment: stateCommitment,
-		logProviderConfig: {
-			type: 'polling',
-			frequency: 1000,
-			// type: 'websocket',
-		},
+		logProviderConfig,
 	});
 
 	const slotSubscriber = new SlotSubscriber(connection, {});
@@ -476,6 +513,7 @@ const runBot = async () => {
 					driftPid: clearingHousePublicKey.toBase58(),
 					walletAuthority: wallet.publicKey.toBase58(),
 				},
+				fillerPollingInterval,
 				parseInt(metricsPort)
 			)
 		);
@@ -494,6 +532,7 @@ const runBot = async () => {
 					driftPid: clearingHousePublicKey.toBase58(),
 					walletAuthority: wallet.publicKey.toBase58(),
 				},
+				fillerPollingInterval,
 				parseInt(metricsPort)
 			)
 		);
@@ -598,6 +637,17 @@ const runBot = async () => {
 						return;
 					}
 				}
+
+				if (opts.websocket) {
+					/* @ts-ignore */
+					if (!driftClient.connection._rpcWebSocketConnected) {
+						logger.error(`Connection rpc websocket disconnected`);
+						res.writeHead(500);
+						res.end(`Connection rpc websocket disconnected`);
+						return;
+					}
+				}
+
 				// check if a slot was received recently
 				let healthySlotSubscriber = false;
 				await lastSlotReceivedMutex.runExclusive(async () => {
