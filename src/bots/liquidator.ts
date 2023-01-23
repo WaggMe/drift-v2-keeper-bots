@@ -55,6 +55,10 @@ require('dotenv').config();
 const WEBHOOK_URL_LIQUIDATOR = process.env.WEBHOOK_URL_LIQUIDATOR;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
+require('dotenv').config();
+const WEBHOOK_URL_LIQUIDATOR = process.env.WEBHOOK_URL_LIQUIDATOR;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+
 const USER_MAP_RESYNC_COOLDOWN_SLOTS = 50;
 
 const errorCodesToSuppress = [
@@ -519,6 +523,17 @@ export class LiquidatorBot implements Bot {
 					this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM.toNumber()) *
 				100.0
 			}% per liquidation`
+		);
+		webhookMessage(
+			`${this.name} free collateral: $${convertToNumber(
+				freeCollateral,
+				QUOTE_PRECISION
+			)}, spending at most ${
+				(this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL.toNumber() /
+					this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM.toNumber()) *
+				100.0
+			}% per liquidation`
+			,WEBHOOK_URL
 		);
 	}
 

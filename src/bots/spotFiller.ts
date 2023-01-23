@@ -59,6 +59,9 @@ import { getErrorCode } from '../error';
 require('dotenv').config();
 const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
 
+require('dotenv').config();
+const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
+
 /**
  * Size of throttled nodes to get to before pruning the map
  */
