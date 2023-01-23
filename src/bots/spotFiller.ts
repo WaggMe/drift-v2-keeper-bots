@@ -24,6 +24,7 @@ import {
 	convertToNumber,
 	BASE_PRECISION,
 	PRICE_PRECISION,
+	WrappedEvent,
 } from '@drift-labs/sdk';
 import {
 	Mutex,
@@ -53,6 +54,10 @@ import { logger } from '../logger';
 import { Bot } from '../types';
 import { RuntimeSpec, metricAttrFromUserAccount } from '../metrics';
 import { webhookMessage } from '../webhook';
+import { getErrorCode } from '../error';
+
+require('dotenv').config();
+const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
 
 require('dotenv').config();
 const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
@@ -68,7 +73,21 @@ const THROTTLED_NODE_SIZE_TO_PRUNE = 10;
 const FILL_ORDER_BACKOFF = 10000;
 const USER_MAP_RESYNC_COOLDOWN_SLOTS = 50;
 
+/**
+ * Constants to determine if we should add a priority fee to a transaction
+ */
+const pendingTxKink1 = 5; // number of pending tx before we start adding a priority fee starting at minPriorityFee
+const pendingTxKink2 = 10; // number of pending tx after which we clamp the priority fee to maxPriorityFee
+
+// the max priority fee we will add on top of the 5000 lamport base fee.
+const minPriorityFee = 5000;
+const maxPriorityFee = 10000;
+
 const dlobMutexError = new Error('dlobMutex timeout');
+
+const errorCodesToSuppress = [
+	6061, // Error Number: 6061. Error Message: Order does not exist.
+];
 
 enum METRIC_TYPES {
 	sdk_call_duration_histogram = 'sdk_call_duration_histogram',
@@ -83,6 +102,7 @@ enum METRIC_TYPES {
 	observed_fills_count = 'observed_fills_count',
 	user_map_user_account_keys = 'user_map_user_account_keys',
 	user_stats_map_authority_keys = 'user_stats_map_authority_keys',
+	pending_transactions = 'pending_transactions',
 }
 
 export class SpotFillerBot implements Bot {
@@ -114,6 +134,10 @@ export class SpotFillerBot implements Bot {
 
 	private intervalIds: Array<NodeJS.Timer> = [];
 	private throttledNodes = new Map<string, number>();
+	private pendingTransactionsBuffer = new SharedArrayBuffer(16); // 16 byte shared buffer
+	private pendingTransactionsArray = new Uint8Array(
+		this.pendingTransactionsBuffer
+	);
 
 	// metrics
 	private metricsInitialized = false;
@@ -133,6 +157,7 @@ export class SpotFillerBot implements Bot {
 	private lastTryFillTimeGauge: ObservableGauge;
 	private userMapUserAccountKeysGauge: ObservableGauge;
 	private userStatsMapAuthorityKeysGauge: ObservableGauge;
+	private pendingTransactionsGauge: ObservableGauge;
 
 	constructor(
 		name: string,
@@ -172,6 +197,15 @@ export class SpotFillerBot implements Bot {
 		this.metricsPort = metricsPort;
 		if (this.metricsPort) {
 			//this.initializeMetrics();
+		}
+
+		// load the pending tx atomic
+		for (const spotMarket of SpotMarkets[
+			this.runtimeSpec.driftEnv as DriftEnv
+		]) {
+			if (spotMarket.serumMarket) {
+				Atomics.store(this.pendingTransactionsArray, spotMarket.marketIndex, 0);
+			}
 		}
 	}
 
@@ -278,6 +312,31 @@ export class SpotFillerBot implements Bot {
 		);
 		this.userStatsMapAuthorityKeysGauge.addCallback(async (obs) => {
 			obs.observe(this.userStatsMap.size());
+		});
+
+		this.pendingTransactionsGauge = this.meter.createObservableGauge(
+			METRIC_TYPES.pending_transactions,
+			{
+				description:
+					'number of pending transactions we are currently waiting on',
+			}
+		);
+		this.pendingTransactionsGauge.addCallback(async (obs) => {
+			for (const spotMarket of SpotMarkets[
+				this.runtimeSpec.driftEnv as DriftEnv
+			]) {
+				if (spotMarket.serumMarket) {
+					const marketIndex = spotMarket.marketIndex;
+					const symbol = spotMarket.symbol;
+					obs.observe(
+						Atomics.load(this.pendingTransactionsArray, marketIndex),
+						{
+							marketIndex: marketIndex,
+							symbol: symbol,
+						}
+					);
+				}
+			}
 		});
 
 		this.sdkCallDurationHistogram = this.meter.createHistogram(
@@ -405,14 +464,23 @@ export class SpotFillerBot implements Bot {
 		return healthy;
 	}
 
-	public async trigger(record: any) {
-		await this.userMapMutex.runExclusive(async () => {
-			await this.userMap.updateWithEventRecord(record);
-			await this.userStatsMap.updateWithEventRecord(record, this.userMap);
-		});
+	public async trigger(record: WrappedEvent<any>) {
+		// logger.info(
+		// 	`Spot filler seen record (slot: ${record.slot}): ${record.eventType}`
+		// );
+
+		// potentially a race here, but the lock is really slow :/
+		// await this.userMapMutex.runExclusive(async () => {
+		await this.userMap.updateWithEventRecord(record);
+		await this.userStatsMap.updateWithEventRecord(record, this.userMap);
+		// });
 
 		if (record.eventType === 'OrderRecord') {
-			await this.trySpotFill(record as OrderRecord);
+			const orderRecord = record as OrderRecord;
+			const marketType = getVariant(orderRecord.order.marketType);
+			if (marketType === 'spot') {
+				await this.trySpotFill(orderRecord);
+			}
 		} else if (record.eventType === 'OrderActionRecord') {
 			const actionRecord = record as OrderActionRecord;
 
@@ -603,6 +671,55 @@ export class SpotFillerBot implements Bot {
 		this.throttledNodes.delete(nodeSignature);
 	}
 
+	private incPendingTransactions(spotMarketIndex: number): number {
+		return Atomics.add(this.pendingTransactionsArray, spotMarketIndex, 1) + 1;
+	}
+
+	private decPendingTransactions(spotMarketIndex: number): number {
+		return Atomics.sub(this.pendingTransactionsArray, spotMarketIndex, 1) - 1;
+	}
+
+	/**
+	 *
+	 * Priority fee paid (in addition to 5000 lamport base fee)
+	 *
+	 *                 /---------   <-- maxPriorityFee
+	 *                / ^ pendingTxKink2
+	 *               /
+	 *              /   <-- minPriorityFee
+	 *             |
+	 * ------------|    <-- 0 priority fee
+	 *             ^ pendingTxKink1
+	 *
+	 * ---- number of pending txs ----->
+	 *
+	 *
+	 * PriorityFee = (computeUnitLimit * computeUnitPrice * 1e-6) lamports
+	 * BaseFee = 5000 lamports
+	 * TotalFeePaid = BaseFee + PriorityFee lamports
+	 *
+	 * @return computeUnitPrice in micro lamports (can be passed into ComputeBudgetProgram.setComputeUnitPrice)
+	 */
+	private calcComputeUnitPrice(
+		currPendingTx: number,
+		computeUnitLimit: number
+	): number {
+		if (currPendingTx < pendingTxKink1) {
+			return 0;
+		} else if (
+			currPendingTx >= pendingTxKink1 &&
+			currPendingTx < pendingTxKink2
+		) {
+			const m =
+				(maxPriorityFee - minPriorityFee) / (pendingTxKink2 - pendingTxKink1);
+			const b = minPriorityFee - m * pendingTxKink1;
+			const priorityFee = m * currPendingTx + b;
+			return priorityFee / (computeUnitLimit * 1e-6);
+		} else {
+			return maxPriorityFee / (computeUnitLimit * 1e-6);
+		}
+	}
+
 	private async tryFillSpotNode(nodeToFill: NodeToFill) {
 		const nodeSignature = this.getNodeToFillSignature(nodeToFill);
 		if (this.nodeIsThrottled(nodeSignature)) {
@@ -675,7 +792,19 @@ export class SpotFillerBot implements Bot {
 			);
 		}
 
-		const start = Date.now();
+		const txStart = Date.now();
+		const currPendingTxs = this.incPendingTransactions(
+			nodeToFill.node.order.marketIndex
+		);
+		const computeUnits = 1_000_000;
+		const computeUnitsPrice = this.calcComputeUnitPrice(
+			currPendingTxs,
+			computeUnits
+		);
+		logger.info(
+			`sending - currPendingTxs: ${currPendingTxs}, computeUnits: ${computeUnits}, computeUnitsPrice: ${computeUnitsPrice}`
+		);
+
 		this.driftClient
 			.fillSpotOrder(
 				chUser.getUserAccountPublicKey(),
@@ -683,15 +812,26 @@ export class SpotFillerBot implements Bot {
 				nodeToFill.node.order,
 				serumFulfillmentConfig,
 				makerInfo,
-				referrerInfo
+				referrerInfo,
+				{
+					computeUnits,
+					computeUnitsPrice,
+				}
 			)
-			.then((tx) => {
-				logger.info(`Filled spot order ${nodeSignature}, TX: ${tx}`);
-				webhookMessage(
-					`[${this.name}]: Filled spot order ${nodeSignature}, TX: ${tx}`
-					,WEBHOOK_URL_FILLER
+			.then((txSig) => {
+				logger.info(`Filled spot order ${nodeSignature}, TX: ${txSig}`);
+
+				const pendingTxs = this.decPendingTransactions(
+					nodeToFill.node.order.marketIndex
 				);
-				/*const duration = Date.now() - start;
+				logger.info(`done - currPendingTxs: ${pendingTxs}`);
+
+				webhookMessage(
+                                        `[${this.name}]: Filled spot order ${nodeSignature}, TX: ${txSig}`
+                                        ,WEBHOOK_URL_FILLER
+                                );
+
+				/*const duration = Date.now() - txStart;
 				const user = this.driftClient.getUser();
 				this.sdkCallDurationHistogram.record(duration, {
 					...metricAttrFromUserAccount(
@@ -700,16 +840,32 @@ export class SpotFillerBot implements Bot {
 					),
 					method: 'fillSpotOrder',
 				});*/
+				// TODO: should parse the tx logs and determine if we were really successful
+				this.successfulFillsCounter.add(1, {
+					market:
+						SpotMarkets[this.runtimeSpec.driftEnv][
+							nodeToFill.node.order.marketIndex
+						].symbol,
+				});
 			})
 			.catch((e) => {
+				const pendingTxs = this.decPendingTransactions(
+					nodeToFill.node.order.marketIndex
+				);
+				logger.info(`sim error - currPendingTxs: ${pendingTxs}`);
+
 				logger.error(`Failed to fill spot order:`);
 				console.error(e);
-				webhookMessage(
-					`[${this.name}]: :x: error trying to fill spot orders:\n${
-						e.logs ? (e.logs as Array<string>).join('\n') : ''
-					}\n${e.stack ? e.stack : e.message}`
-          ,WEBHOOK_URL_FILLER
-				);
+
+				const errorCode = getErrorCode(e);
+				if (!errorCodesToSuppress.includes(errorCode)) {
+					webhookMessage(
+						`[${this.name}]: :x: error trying to fill spot orders:\n${
+							e.logs ? (e.logs as Array<string>).join('\n') : ''
+						}\n${e.stack ? e.stack : e.message}`
+						,WEBHOOK_URL_FILLER
+					);
+				}
 			})
 			.finally(() => {
 				this.unthrottleNode(nodeSignature);
