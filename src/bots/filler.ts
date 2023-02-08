@@ -59,6 +59,18 @@ import { logger } from '../logger';
 import { Bot } from '../types';
 import { RuntimeSpec, metricAttrFromUserAccount } from '../metrics';
 import { webhookMessage } from '../webhook';
+import {
+	isEndIxLog,
+	isErrFillingLog,
+	isErrStaleOracle,
+	isFillIxLog,
+	isIxLog,
+	isMakerBreachedMaintenanceMarginLog,
+	isMakerFallbackLog,
+	isMakerOrderDoesNotExistLog,
+	isOrderDoesNotExistLog,
+	isTakerBreachedMaintenanceMarginLog,
+} from './common/txLogParse';
 
 require('dotenv').config();
 const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
@@ -92,15 +104,16 @@ enum METRIC_TYPES {
 export class FillerBot implements Bot {
 	public readonly name: string;
 	public readonly dryRun: boolean;
-	public readonly defaultIntervalMs: number = 2000;
+	public readonly defaultIntervalMs: number = 6000;
 
 	private slotSubscriber: SlotSubscriber;
 	private bulkAccountLoader: BulkAccountLoader | undefined;
 	private driftClient: DriftClient;
+	private pollingIntervalMs: number;
 
 	private dlobMutex = withTimeout(
 		new Mutex(),
-		10 * this.defaultIntervalMs,
+		2 * this.defaultIntervalMs,
 		dlobMutexError
 	);
 	private dlob: DLOB;
@@ -152,7 +165,8 @@ export class FillerBot implements Bot {
 		bulkAccountLoader: BulkAccountLoader | undefined,
 		driftClient: DriftClient,
 		runtimeSpec: RuntimeSpec,
-		metricsPort?: number | undefined
+		pollingIntervalMs?: number,
+		metricsPort?: number
 	) {
 		this.name = name;
 		this.dryRun = dryRun;
@@ -160,6 +174,10 @@ export class FillerBot implements Bot {
 		this.bulkAccountLoader = bulkAccountLoader;
 		this.driftClient = driftClient;
 		this.runtimeSpec = runtimeSpec;
+		if (!pollingIntervalMs) {
+			pollingIntervalMs = this.defaultIntervalMs;
+		}
+		this.pollingIntervalMs = pollingIntervalMs;
 
 		this.metricsPort = metricsPort;
 		if (this.metricsPort) {
@@ -362,8 +380,11 @@ export class FillerBot implements Bot {
 
 	public async reset() {}
 
-	public async startIntervalLoop(intervalMs: number) {
-		const intervalId = setInterval(this.tryFill.bind(this), intervalMs);
+	public async startIntervalLoop(_intervalMs: number) {
+		const intervalId = setInterval(
+			this.tryFill.bind(this),
+			this.pollingIntervalMs
+		);
 		this.intervalIds.push(intervalId);
 
 		logger.info(`${this.name} Bot started!`);
@@ -373,13 +394,25 @@ export class FillerBot implements Bot {
 		let healthy = false;
 		await this.watchdogTimerMutex.runExclusive(async () => {
 			healthy =
-				this.watchdogTimerLastPatTime > Date.now() - 5 * this.defaultIntervalMs;
+				this.watchdogTimerLastPatTime > Date.now() - 5 * this.pollingIntervalMs;
+			if (!healthy) {
+				logger.warn(
+					`watchdog timer last pat time ${this.watchdogTimerLastPatTime} is too old`
+				);
+			}
 		});
 
 		const stateAccount = this.driftClient.getStateAccount();
 		const userMapResyncRequired =
 			this.userMap.size() !== stateAccount.numberOfSubAccounts.toNumber() ||
 			this.userStatsMap.size() !== stateAccount.numberOfAuthorities.toNumber();
+		if (userMapResyncRequired) {
+			logger.warn(
+				`${
+					this.name
+				} user map resync required, userMap size: ${this.userMap.size()}, stateAccount.numberOfSubAccounts: ${stateAccount.numberOfSubAccounts.toNumber()}, userStatsMap size: ${this.userStatsMap.size()}, stateAccount.numberOfAuthorities: ${stateAccount.numberOfAuthorities.toNumber()}`
+			);
+		}
 
 		healthy = healthy && !userMapResyncRequired;
 
@@ -387,20 +420,26 @@ export class FillerBot implements Bot {
 	}
 
 	public async trigger(record: WrappedEvent<any>) {
-		await this.userMapMutex.runExclusive(async () => {
-			await this.userMap.updateWithEventRecord(record);
-			await this.userStatsMap.updateWithEventRecord(record, this.userMap);
-		});
-		logger.info(`filler seen record: ${record.eventType}`);
+		logger.debug(
+			`filler seen record (slot: ${record.slot}): ${record.eventType}`
+		);
+		if (record.order) {
+			logger.debug(` . ${record.user} - ${record.order.orderId}`);
+		}
+		// potentially a race here, but the lock is really slow :/
+		// await this.userMapMutex.runExclusive(async () => {
+		await this.userMap.updateWithEventRecord(record);
+		await this.userStatsMap.updateWithEventRecord(record, this.userMap);
+		// });
 
 		if (record.eventType === 'OrderRecord') {
-			await this.tryFill(record as OrderRecord);
+			const orderRecord = record as OrderRecord;
+			const marketType = getVariant(orderRecord.order.marketType);
+			if (marketType === 'perp') {
+				await this.tryFill(orderRecord);
+			}
 		} else if (record.eventType === 'OrderActionRecord') {
 			const actionRecord = record as OrderActionRecord;
-			logger.info(
-				`OrderRecordAction.action: ${getVariant(actionRecord.action)}`
-			);
-
 			if (getVariant(actionRecord.action) === 'fill') {
 				const marketType = getVariant(actionRecord.marketType);
 				if (marketType === 'perp') {
@@ -743,102 +782,8 @@ export class FillerBot implements Bot {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 
-	private isIxLog(log: string): boolean {
-		const match = log.match(new RegExp('Program log: Instruction:'));
-
-		return match !== null;
-	}
-
-	private isEndIxLog(log: string): boolean {
-		const match = log.match(
-			new RegExp(
-				`Program ${this.driftClient.program.programId.toBase58()} consumed ([0-9]+) of ([0-9]+) compute units`
-			)
-		);
-
-		return match !== null;
-	}
-
-	private isFillIxLog(log: string): boolean {
-		const match = log.match(
-			new RegExp('Program log: Instruction: Fill(.*)Order')
-		);
-
-		return match !== null;
-	}
-
-	private isOrderDoesNotExistLog(log: string): number | null {
-		const match = log.match(new RegExp('.*Order does not exist ([0-9]+)'));
-
-		if (!match) {
-			return null;
-		}
-
-		return parseInt(match[1]);
-	}
-
-	private isMakerOrderDoesNotExistLog(log: string): number | null {
-		const match = log.match(new RegExp('.*Maker has no order id ([0-9]+)'));
-
-		if (!match) {
-			return null;
-		}
-
-		return parseInt(match[1]);
-	}
-
-	private isMakerFallbackLog(log: string): number | null {
-		const match = log.match(
-			new RegExp('.*Using fallback maker order id ([0-9]+)')
-		);
-
-		if (!match) {
-			return null;
-		}
-
-		return parseInt(match[1]);
-	}
-
-	private isMakerBreachedMaintenanceMarginLog(log: string): boolean {
-		const match = log.match(
-			new RegExp('.*maker breached maintenance requirements.*')
-		);
-
-		return match !== null;
-	}
-
-	private isTakerBreachedMaintenanceMarginLog(log: string): boolean {
-		const match = log.match(
-			new RegExp('.*taker breached maintenance requirements.*')
-		);
-
-		return match !== null;
-	}
-
-	private isErrFillingLog(log: string): [string, string] | null {
-		const match = log.match(
-			new RegExp('.*Err filling order id ([0-9]+) for user ([a-zA-Z0-9]+)')
-		);
-
-		if (!match) {
-			return null;
-		}
-
-		return [match[1], match[2]];
-	}
-
-	private isErrStaleOracle(log: string): boolean {
-		const match = log.match(new RegExp('.*Invalid Oracle: Stale.*'));
-
-		if (!match) {
-			return false;
-		}
-
-		return true;
-	}
-
 	/**
-	 * Iterates through a tx's logs and handles it appropriately (e.g. throttling users, updating metrics, etc.)
+	 * Iterates through a tx's logs and handles it appropriately 3e.g. throttling users, updating metrics, etc.)
 	 *
 	 * @param nodesFilled nodes that we sent a transaction to fill
 	 * @param logs logs from tx.meta.logMessages or this.clearingHouse.program._events._eventParser.parseLogs
@@ -869,7 +814,7 @@ export class FillerBot implements Bot {
 				continue;
 			}
 
-			if (this.isEndIxLog(log)) {
+			if (isEndIxLog(this.driftClient.program.programId.toBase58(), log)) {
 				if (!errorThisFillIx) {
 					successCount++;
 				}
@@ -879,8 +824,8 @@ export class FillerBot implements Bot {
 				continue;
 			}
 
-			if (this.isIxLog(log)) {
-				if (this.isFillIxLog(log)) {
+			if (isIxLog(log)) {
+				if (isFillIxLog(log)) {
 					inFillIx = true;
 					errorThisFillIx = false;
 					ixIdx++;
@@ -941,7 +886,7 @@ export class FillerBot implements Bot {
 			}
 
 			// try to handle the log line
-			const orderIdDoesNotExist = this.isOrderDoesNotExistLog(log);
+			const orderIdDoesNotExist = isOrderDoesNotExistLog(log);
 			if (orderIdDoesNotExist) {
 				const filledNode = nodesFilled[ixIdx];
 				logger.error(
@@ -954,7 +899,7 @@ export class FillerBot implements Bot {
 				continue;
 			}
 
-			const makerOrderIdDoesNotExist = this.isMakerOrderDoesNotExistLog(log);
+			const makerOrderIdDoesNotExist = isMakerOrderDoesNotExistLog(log);
 			if (makerOrderIdDoesNotExist) {
 				const filledNode = nodesFilled[ixIdx];
 				if (!filledNode.makerNode) {
@@ -981,7 +926,7 @@ export class FillerBot implements Bot {
 				continue;
 			}
 
-			const makerFallbackOrderId = this.isMakerFallbackLog(log);
+			const makerFallbackOrderId = isMakerFallbackLog(log);
 			if (makerFallbackOrderId) {
 				const filledNode = nodesFilled[ixIdx];
 				if (!filledNode.makerNode) {
@@ -1009,7 +954,7 @@ export class FillerBot implements Bot {
 			}
 
 			const makerBreachedMaintenanceMargin =
-				this.isMakerBreachedMaintenanceMarginLog(log);
+				isMakerBreachedMaintenanceMarginLog(log);
 			if (makerBreachedMaintenanceMargin) {
 				const filledNode = nodesFilled[ixIdx];
 				if (!filledNode.makerNode) {
@@ -1025,7 +970,7 @@ export class FillerBot implements Bot {
 				const makerNodeSignature =
 					this.getFillSignatureFromUserAccountAndOrderId(
 						filledNode.makerNode.userAccount.toString(),
-						makerFallbackOrderId.toString()
+						filledNode.makerNode.order.orderId.toString()
 					);
 				logger.error(
 					`maker breach maint. margin, assoc node (ixIdx: ${ixIdx}): ${filledNode.makerNode.userAccount.toString()}, ${
@@ -1034,11 +979,46 @@ export class FillerBot implements Bot {
 				);
 				this.throttledNodes.set(makerNodeSignature, Date.now());
 				errorThisFillIx = true;
+
+				const tx = new Transaction();
+				tx.add(
+					ComputeBudgetProgram.requestUnits({
+						units: 1_000_000,
+						additionalFee: 0,
+					})
+				);
+				tx.add(
+					await this.driftClient.getForceCancelOrdersIx(
+						filledNode.makerNode.userAccount,
+						(
+							await this.userMap.mustGet(
+								filledNode.makerNode.userAccount.toString()
+							)
+						).getUserAccount()
+					)
+				);
+				this.driftClient.txSender
+					.send(tx, [], this.driftClient.opts)
+					.then((txSig) => {
+						logger.info(
+							`Force cancelled orders for maker ${filledNode.makerNode.userAccount.toBase58()} due to breach of maintenance margin. Tx: ${txSig}`
+						);
+					})
+					.catch((e) => {
+						console.error(e);
+						logger.error(`Failed to send ForceCancelOrder Ixs (error above):`);
+						webhookMessage(
+							`[${this.name}]: :x: error processing fill tx logs:\n${
+								e.stack ? e.stack : e.message
+							}`
+						);
+					});
+
 				continue;
 			}
 
 			const takerBreachedMaintenanceMargin =
-				this.isTakerBreachedMaintenanceMarginLog(log);
+				isTakerBreachedMaintenanceMarginLog(log);
 			if (takerBreachedMaintenanceMargin) {
 				const filledNode = nodesFilled[ixIdx];
 				const takerNodeSignature =
@@ -1069,26 +1049,12 @@ export class FillerBot implements Bot {
 						).getUserAccount()
 					)
 				);
-				let makerIfExist = '';
-				if (filledNode.makerNode) {
-					makerIfExist = ` and maker ${filledNode.makerNode.userAccount.toBase58()}`;
-					tx.add(
-						await this.driftClient.getForceCancelOrdersIx(
-							filledNode.makerNode.userAccount,
-							(
-								await this.userMap.mustGet(
-									filledNode.makerNode.userAccount.toString()
-								)
-							).getUserAccount()
-						)
-					);
-				}
 
 				this.driftClient.txSender
 					.send(tx, [], this.driftClient.opts)
 					.then((txSig) => {
 						logger.info(
-							`Force cancelled orders for user ${filledNode.node.userAccount.toBase58()}${makerIfExist} due to breach of maintenance margin. Tx: ${txSig}`
+							`Force cancelled orders for user ${filledNode.node.userAccount.toBase58()} due to breach of maintenance margin. Tx: ${txSig}`
 						);
 					})
 					.catch((e) => {
@@ -1104,7 +1070,7 @@ export class FillerBot implements Bot {
 				continue;
 			}
 
-			const errFillingLog = this.isErrFillingLog(log);
+			const errFillingLog = isErrFillingLog(log);
 			if (errFillingLog) {
 				const orderId = errFillingLog[0];
 				const userAcc = errFillingLog[1];
@@ -1123,14 +1089,8 @@ export class FillerBot implements Bot {
 				continue;
 			}
 
-			if (this.isErrStaleOracle(log)) {
+			if (isErrStaleOracle(log)) {
 				logger.error(`Stale oracle error: ${log}`);
-				errorThisFillIx = true;
-				continue;
-			}
-
-			// probably some anchor log
-			if (log.length > 100) {
 				errorThisFillIx = true;
 				continue;
 			}

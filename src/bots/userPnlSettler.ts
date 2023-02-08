@@ -16,13 +16,13 @@ import {
 	ZERO,
 	calculateNetUserPnlImbalance,
 	convertToNumber,
+	isOracleValid,
 } from '@drift-labs/sdk';
 import { Mutex } from 'async-mutex';
 
 import { getErrorCode } from '../error';
 import { logger } from '../logger';
 import { Bot } from '../types';
-import { Metrics } from '../metrics';
 import { webhookMessage } from '../webhook';
 
 type SettlePnlIxParams = {
@@ -36,6 +36,11 @@ type SettlePnlIxParams = {
 const MIN_PNL_TO_SETTLE = new BN(-10).mul(QUOTE_PRECISION);
 const SETTLE_USER_CHUNKS = 2;
 
+const errorCodesToSuppress = [
+	6010, // Error Code: UserHasNoPositionInMarket. Error Number: 6010. Error Message: User Has No Position In Market.
+	6035, // Error Code: InvalidOracle. Error Number: 6035. Error Message: InvalidOracle.
+];
+
 export class UserPnlSettlerBot implements Bot {
 	public readonly name: string;
 	public readonly dryRun: boolean;
@@ -46,7 +51,6 @@ export class UserPnlSettlerBot implements Bot {
 	private userMap: UserMap;
 	private perpMarkets: PerpMarketConfig[];
 	private spotMarkets: SpotMarketConfig[];
-	private metrics: Metrics | undefined;
 
 	private watchdogTimerMutex = new Mutex();
 	private watchdogTimerLastPatTime = Date.now();
@@ -54,17 +58,15 @@ export class UserPnlSettlerBot implements Bot {
 	constructor(
 		name: string,
 		dryRun: boolean,
-		clearingHouse: DriftClient,
+		driftClient: DriftClient,
 		perpMarkets: PerpMarketConfig[],
-		spotMarkets: SpotMarketConfig[],
-		metrics?: Metrics | undefined
+		spotMarkets: SpotMarketConfig[]
 	) {
 		this.name = name;
 		this.dryRun = dryRun;
-		this.driftClient = clearingHouse;
+		this.driftClient = driftClient;
 		this.perpMarkets = perpMarkets;
 		this.spotMarkets = spotMarkets;
-		this.metrics = metrics;
 	}
 
 	public async init() {
@@ -151,6 +153,24 @@ export class UserPnlSettlerBot implements Bot {
 				};
 			});
 
+			const slot = await this.driftClient.connection.getSlot();
+
+			const validOracleMarketMap = new Map<number, boolean>();
+			this.perpMarkets.forEach((market) => {
+				const oracleValid = isOracleValid(
+					perpMarketAndOracleData[market.marketIndex].marketAccount.amm,
+					perpMarketAndOracleData[market.marketIndex].oraclePriceData,
+					this.driftClient.getStateAccount().oracleGuardRails,
+					slot
+				);
+
+				if (!oracleValid) {
+					logger.warn(`Oracle for market ${market.marketIndex} is not valid`);
+				}
+
+				validOracleMarketMap.set(market.marketIndex, oracleValid);
+			});
+
 			const usersToSettle: SettlePnlIxParams[] = [];
 
 			for (const user of this.userMap.values()) {
@@ -165,6 +185,12 @@ export class UserPnlSettlerBot implements Bot {
 					}
 
 					const marketIndexNum = settleePosition.marketIndex;
+
+					const oracleValid = validOracleMarketMap.get(marketIndexNum);
+					if (!oracleValid) {
+						continue;
+					}
+
 					const unsettledPnl = calculateClaimablePnl(
 						perpMarketAndOracleData[marketIndexNum].marketAccount,
 						spotMarketAndOracleData[0].marketAccount, // always liquidating the USDC spot market
@@ -246,47 +272,58 @@ export class UserPnlSettlerBot implements Bot {
 					throw new Error('Dry run - not sending settle pnl tx');
 				}
 
+				const settlePnlPromises = new Array<Promise<string>>();
 				for (let i = 0; i < params.users.length; i += SETTLE_USER_CHUNKS) {
 					const usersChunk = params.users.slice(i, i + SETTLE_USER_CHUNKS);
 					try {
-						const txSig = await this.driftClient.settlePNLs(
-							usersChunk,
-							params.marketIndex
-						);
-						logger.info(
-							`PNL settled successfully on ${marketStr}. TxSig: ${txSig}`
-						);
-						this.metrics?.recordSettlePnl(
-							usersChunk.length,
-							params.marketIndex,
-							this.name
+						settlePnlPromises.push(
+							this.driftClient.settlePNLs(usersChunk, params.marketIndex)
 						);
 					} catch (err) {
 						const errorCode = getErrorCode(err);
-						this.metrics?.recordErrorCode(
-							errorCode,
-							this.driftClient.provider.wallet.publicKey,
-							this.name
-						);
 						logger.error(
 							`Error code: ${errorCode} while settling pnls for ${marketStr}: ${err.message}`
 						);
 						console.error(err);
-						await webhookMessage(
-							`[${
-								this.name
-							}]: :x: Error code: ${errorCode} while settling pnls for ${marketStr}:\n${
-								err.logs ? (err.logs as Array<string>).join('\n') : ''
-							}\n${err.stack ? err.stack : err.message}`
-						);
+						if (!errorCodesToSuppress.includes(errorCode)) {
+							await webhookMessage(
+								`[${
+									this.name
+								}]: :x: Error code: ${errorCode} while settling pnls for ${marketStr}:\n${
+									err.logs ? (err.logs as Array<string>).join('\n') : ''
+								}\n${err.stack ? err.stack : err.message}`
+							);
+						}
 					}
 				}
+				const txs = await Promise.all(settlePnlPromises);
+				for (const tx of txs) {
+					logger.info(`Settle PNL tx: ${tx}`);
+				}
 			}
-		} catch (e) {
-			console.error(e);
-			await webhookMessage(
-				`[${this.name}]: :x: uncaught error:\n${e.stack ? e.stack : e.messaage}`
-			);
+		} catch (err) {
+			console.error(err);
+			if (
+				!(err as Error).message.includes('Transaction was not confirmed') &&
+				!(err as Error).message.includes('Blockhash not found')
+			) {
+				const errorCode = getErrorCode(err);
+				if (!errorCodesToSuppress.includes(errorCode)) {
+					await webhookMessage(
+						`[${
+							this.name
+						}]: :x: Uncaught error: Error code: ${errorCode} while settling pnls:\n${
+							err.logs ? (err.logs as Array<string>).join('\n') : ''
+						}\n${err.stack ? err.stack : err.message}`
+					);
+				} else {
+					await webhookMessage(
+						`[${this.name}]: :x: uncaught error:\n${
+							err.stack ? err.stack : err.messaage
+						}`
+					);
+				}
+			}
 		} finally {
 			logger.info('Settle PNLs finished');
 			await this.watchdogTimerMutex.runExclusive(async () => {

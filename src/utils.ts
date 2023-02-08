@@ -36,7 +36,15 @@ export async function getOrCreateAssociatedTokenAccount(
 			)
 		);
 		const txSig = await connection.sendTransaction(tx, [wallet.payer]);
-		await connection.confirmTransaction(txSig, 'confirmed');
+		const latestBlock = await connection.getLatestBlockhash();
+		await connection.confirmTransaction(
+			{
+				signature: txSig,
+				blockhash: latestBlock.blockhash,
+				lastValidBlockHeight: latestBlock.lastValidBlockHeight,
+			},
+			'confirmed'
+		);
 	}
 
 	return associatedTokenAccount;

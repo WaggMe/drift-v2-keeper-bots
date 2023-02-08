@@ -28,6 +28,8 @@ import {
 	BASE_PRECISION,
 	getSignedTokenAmount,
 	TokenFaucet,
+	DriftClientSubscriptionConfig,
+	LogProviderConfig,
 } from '@drift-labs/sdk';
 import { promiseTimeout } from '@drift-labs/sdk/lib/util/promiseTimeout';
 import { Mutex } from 'async-mutex';
@@ -63,6 +65,21 @@ const metricsPort =
 	process.env.METRICS_PORT ||
 	PrometheusExporter.DEFAULT_OPTIONS.port.toString();
 
+const bulkAccountLoaderPollingInterval = process.env
+	.BULK_ACCOUNT_LOADER_POLLING_INTERVAL
+	? parseInt(process.env.BULK_ACCOUNT_LOADER_POLLING_INTERVAL)
+	: 5000;
+const eventSubscriberPollingInterval = process.env
+	.EVENT_SUBSCRIBER_POLLING_INTERVAL
+	? parseInt(process.env.EVENT_SUBSCRIBER_POLLING_INTERVAL)
+	: 5000;
+
+// TODO: do these bot specific configs better
+const fillerPollingInterval = process.env.FILLER_POLLING_INTERVAL
+	? parseInt(process.env.FILLER_POLLING_INTERVAL)
+	: 6000;
+const botId = process.env.BOT_ID;
+
 program
 	.option('-d, --dry-run', 'Dry run, do not send transactions on chain')
 	.option(
@@ -96,6 +113,10 @@ program
 		'--run-once',
 		'Exit after running bot loops once (only for supported bots)'
 	)
+	.option(
+		'--websocket',
+		'Use websocket instead of RPC polling for account updates'
+	)
 	.parse();
 
 const opts = program.opts();
@@ -109,6 +130,13 @@ JitMakerBot enabled: ${!!opts.jitMaker},\n\
 IFRevenueSettler enabled: ${!!opts.ifRevenueSettler},\n\
 userPnlSettler enabled: ${!!opts.userPnlSettler},\n\
 `);
+
+logger.info(
+	`BulkAccountLoader polling interval: ${bulkAccountLoaderPollingInterval}ms`
+);
+logger.info(
+	`EventSubscriber polling interval:   ${eventSubscriberPollingInterval}ms`
+);
 
 export function getWallet(): Wallet {
 	const privateKey = process.env.KEEPER_PRIVATE_KEY;
@@ -141,7 +169,9 @@ export function getWallet(): Wallet {
 }
 
 const endpoint = process.env.ENDPOINT;
+const wsEndpoint = process.env.WS_ENDPOINT;
 logger.info(`RPC endpoint: ${endpoint}`);
+logger.info(`WS endpoint:  ${wsEndpoint}`);
 logger.info(`DriftEnv:     ${driftEnv}`);
 logger.info(`Commit:       ${commitHash}`);
 
@@ -244,17 +274,38 @@ const runBot = async () => {
 	const wallet = getWallet();
 	const clearingHousePublicKey = new PublicKey(sdkConfig.DRIFT_PROGRAM_ID);
 
-	const connection = new Connection(endpoint, stateCommitment);
+	const connection = new Connection(endpoint, {
+		wsEndpoint: wsEndpoint,
+		commitment: stateCommitment,
+	});
 
-	const bulkAccountLoader = new BulkAccountLoader(
-		connection,
-		stateCommitment,
-		1000
-	);
-	let lastBulkAccountLoaderSlot = bulkAccountLoader.mostRecentSlot;
+	let bulkAccountLoader: BulkAccountLoader | undefined;
+	let lastBulkAccountLoaderSlot: number | undefined;
+	let accountSubscription: DriftClientSubscriptionConfig = {
+		type: 'websocket',
+	};
+	let logProviderConfig: LogProviderConfig = {
+		type: 'websocket',
+	};
 
-	// const bulkAccountLoader = undefined;
-	// let lastBulkAccountLoaderSlot = undefined;
+	if (!opts.websocket) {
+		bulkAccountLoader = new BulkAccountLoader(
+			connection,
+			stateCommitment,
+			bulkAccountLoaderPollingInterval
+		);
+		lastBulkAccountLoaderSlot = bulkAccountLoader.mostRecentSlot;
+		accountSubscription = {
+			type: 'polling',
+			accountLoader: bulkAccountLoader,
+		};
+
+		logProviderConfig = {
+			type: 'polling',
+			frequency: eventSubscriberPollingInterval,
+		};
+	}
+
 	const driftClient = new DriftClient({
 		connection,
 		wallet,
@@ -264,13 +315,18 @@ const runBot = async () => {
 		oracleInfos: PerpMarkets[driftEnv].map((mkt) => {
 			return { publicKey: mkt.oracle, source: mkt.oracleSource };
 		}),
-		accountSubscription: {
-			// type: 'websocket'
-			type: 'polling',
-			accountLoader: bulkAccountLoader,
+		opts: {
+			commitment: stateCommitment,
+			skipPreflight: false,
+			preflightCommitment: stateCommitment,
 		},
+		accountSubscription,
 		env: driftEnv,
 		userStats: true,
+		txSenderConfig: {
+			type: 'retry',
+			timeout: 5000,
+		},
 	});
 
 	const eventSubscriber = new EventSubscriber(connection, driftClient.program, {
@@ -279,11 +335,7 @@ const runBot = async () => {
 		orderBy: 'blockchain',
 		orderDir: 'desc',
 		commitment: stateCommitment,
-		logProviderConfig: {
-			type: 'polling',
-			frequency: 1000,
-			// type: 'websocket',
-		},
+		logProviderConfig,
 	});
 
 	const slotSubscriber = new SlotSubscriber(connection, {});
@@ -464,7 +516,7 @@ const runBot = async () => {
 	if (opts.filler) {
 		bots.push(
 			new FillerBot(
-				'filler',
+				botId ? `filler-${botId}` : 'filler',
 				!!opts.dry,
 				slotSubscriber,
 				bulkAccountLoader,
@@ -476,6 +528,7 @@ const runBot = async () => {
 					driftPid: clearingHousePublicKey.toBase58(),
 					walletAuthority: wallet.publicKey.toBase58(),
 				},
+				fillerPollingInterval,
 				parseInt(metricsPort)
 			)
 		);
@@ -483,7 +536,7 @@ const runBot = async () => {
 	if (opts.spotFiller) {
 		bots.push(
 			new SpotFillerBot(
-				'spotFiller',
+				botId ? `spotFiller-${botId}` : 'spotFiller',
 				!!opts.dry,
 				bulkAccountLoader,
 				driftClient,
@@ -494,6 +547,7 @@ const runBot = async () => {
 					driftPid: clearingHousePublicKey.toBase58(),
 					walletAuthority: wallet.publicKey.toBase58(),
 				},
+				fillerPollingInterval,
 				parseInt(metricsPort)
 			)
 		);
@@ -501,7 +555,7 @@ const runBot = async () => {
 	if (opts.trigger) {
 		bots.push(
 			new TriggerBot(
-				'trigger',
+				botId ? `trigger-${botId}` : 'trigger',
 				!!opts.dry,
 				bulkAccountLoader,
 				driftClient,
@@ -513,7 +567,7 @@ const runBot = async () => {
 	if (opts.jitMaker) {
 		bots.push(
 			new JitMakerBot(
-				'JitMaker',
+				botId ? `JitMaker-${botId}` : 'JitMaker',
 				!!opts.dry,
 				driftClient,
 				slotSubscriber,
@@ -524,7 +578,7 @@ const runBot = async () => {
 	if (opts.liquidator) {
 		bots.push(
 			new LiquidatorBot(
-				'liquidator',
+				botId ? `liquidator-${botId}` : 'liquidator',
 				!!opts.dry,
 				bulkAccountLoader,
 				driftClient,
@@ -542,7 +596,7 @@ const runBot = async () => {
 	if (opts.floatingMaker) {
 		bots.push(
 			new FloatingPerpMakerBot(
-				'floatingMaker',
+				botId ? `floatingMaker-${botId}` : 'floatingMaker',
 				!!opts.dry,
 				driftClient,
 				slotSubscriber,
@@ -554,12 +608,11 @@ const runBot = async () => {
 	if (opts.userPnlSettler) {
 		bots.push(
 			new UserPnlSettlerBot(
-				'userPnlSettler',
+				botId ? `userPnlSettler-${botId}` : 'userPnlSettler',
 				!!opts.dry,
 				driftClient,
 				PerpMarkets[driftEnv],
-				SpotMarkets[driftEnv],
-				metrics
+				SpotMarkets[driftEnv]
 			)
 		);
 	}
@@ -567,7 +620,7 @@ const runBot = async () => {
 	if (opts.ifRevenueSettler) {
 		bots.push(
 			new IFRevenueSettlerBot(
-				'ifRevenueSettler',
+				botId ? `ifRevenueSettler-${botId}` : 'ifRevenueSettler',
 				!!opts.dry,
 				driftClient,
 				SpotMarkets[driftEnv]
@@ -598,6 +651,17 @@ const runBot = async () => {
 						return;
 					}
 				}
+
+				if (opts.websocket) {
+					/* @ts-ignore */
+					if (!driftClient.connection._rpcWebSocketConnected) {
+						logger.error(`Connection rpc websocket disconnected`);
+						res.writeHead(500);
+						res.end(`Connection rpc websocket disconnected`);
+						return;
+					}
+				}
+
 				// check if a slot was received recently
 				let healthySlotSubscriber = false;
 				await lastSlotReceivedMutex.runExclusive(async () => {
@@ -610,7 +674,7 @@ const runBot = async () => {
 					}
 				});
 				if (!healthySlotSubscriber) {
-					res.writeHead(500);
+					res.writeHead(501);
 					logger.error(`SlotSubscriber is not healthy`);
 					res.end(`SlotSubscriber is not healthy`);
 					return;
@@ -622,7 +686,7 @@ const runBot = async () => {
 						lastBulkAccountLoaderSlot &&
 						bulkAccountLoader.mostRecentSlot === lastBulkAccountLoaderSlot
 					) {
-						res.writeHead(500);
+						res.writeHead(502);
 						res.end(`bulkAccountLoader.mostRecentSlot is not healthy`);
 						logger.error(
 							`Health check failed due to stale bulkAccountLoader.mostRecentSlot`
@@ -637,7 +701,7 @@ const runBot = async () => {
 					const healthCheck = await promiseTimeout(bot.healthCheck(), 1000);
 					if (!healthCheck) {
 						logger.error(`Health check failed for bot ${bot.name}`);
-						res.writeHead(500);
+						res.writeHead(503);
 						res.end(`Bot ${bot.name} is not healthy`);
 						return;
 					}
