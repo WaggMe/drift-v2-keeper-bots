@@ -529,7 +529,7 @@ const runBot = async () => {
 					walletAuthority: wallet.publicKey.toBase58(),
 				},
 				fillerPollingInterval,
-				parseInt(metricsPort)
+				//parseInt(metricsPort)
 			)
 		);
 	}
@@ -548,7 +548,7 @@ const runBot = async () => {
 					walletAuthority: wallet.publicKey.toBase58(),
 				},
 				fillerPollingInterval,
-				parseInt(metricsPort)
+				//parseInt(metricsPort)
 			)
 		);
 	}
@@ -560,7 +560,7 @@ const runBot = async () => {
 				bulkAccountLoader,
 				driftClient,
 				slotSubscriber,
-				metrics
+				//metrics
 			)
 		);
 	}
@@ -571,7 +571,7 @@ const runBot = async () => {
 				!!opts.dry,
 				driftClient,
 				slotSubscriber,
-				metrics
+				//metrics
 			)
 		);
 	}
@@ -589,7 +589,7 @@ const runBot = async () => {
 					driftPid: clearingHousePublicKey.toBase58(),
 					walletAuthority: wallet.publicKey.toBase58(),
 				},
-				parseInt(metricsPort.toString())
+				//parseInt(metricsPort.toString())
 			)
 		);
 	}
@@ -600,7 +600,7 @@ const runBot = async () => {
 				!!opts.dry,
 				driftClient,
 				slotSubscriber,
-				metrics
+				//metrics
 			)
 		);
 	}

@@ -210,7 +210,7 @@ export class SpotFillerBot implements Bot {
 		}
 
 		// load the pending tx atomic
-		for (const spotMarket of SpotMarkets[
+		for (const spotMarket of SpotMarkets[initializeMetrics
 			this.runtimeSpec.driftEnv as DriftEnv
 		]) {
 			if (spotMarket.serumMarket) {
@@ -1096,29 +1096,27 @@ export class SpotFillerBot implements Bot {
 			)
 			.then(async (txSig) => {
 				logger.info(`Filled spot order ${nodeSignature}, TX: ${txSig}`);
-				webhookMessage(
-					`[${this.name}]: Filled spot order ${nodeSignature}, TX: ${tx}`
-					,WEBHOOK_URL_FILLER
-				);
 				const pendingTxs = this.decPendingTransactions(
 					nodeToFill.node.order.marketIndex
 				);
 				logger.info(`done - currPendingTxs: ${pendingTxs}`);
 
 				webhookMessage(
-                                        `[${this.name}]: Filled spot order ${nodeSignature}, TX: ${txSig}`
-                                        ,WEBHOOK_URL_FILLER
-                                );
+					`[${this.name}]: Filled spot order ${nodeSignature}, TX: ${txSig}`
+					,WEBHOOK_URL_FILLER
+				);
 
-				const duration = Date.now() - txStart;
-				const user = this.driftClient.getUser();
-				this.sdkCallDurationHistogram.record(duration, {
-					...metricAttrFromUserAccount(
-						user.getUserAccountPublicKey(),
-						user.getUserAccount()
-					),
-					method: 'fillSpotOrder',
-				});
+				if (this.metricsPort && this.metricsInitialized) {
+					const duration = Date.now() - txStart;
+					const user = this.driftClient.getUser();
+					this.sdkCallDurationHistogram.record(duration, {
+						...metricAttrFromUserAccount(
+							user.getUserAccountPublicKey(),
+							user.getUserAccount()
+						),
+						method: 'fillSpotOrder',
+					});
+				}
 
 				await this.processBulkFillTxLogs(nodeToFill, txSig);
 			})
@@ -1232,15 +1230,17 @@ export class SpotFillerBot implements Bot {
 			}
 		} finally {
 			if (ran) {
-				const duration = Date.now() - startTime;
-				const user = this.driftClient.getUser();
-				this.tryFillDurationHistogram.record(
-					duration,
-					metricAttrFromUserAccount(
-						user.getUserAccountPublicKey(),
-						user.getUserAccount()
-					)
-				);
+				if(this.metricsPort && this.metricsInitialized){
+					const duration = Date.now() - startTime;
+					const user = this.driftClient.getUser();
+					this.tryFillDurationHistogram.record(
+						duration,
+						metricAttrFromUserAccount(
+							user.getUserAccountPublicKey(),
+							user.getUserAccount()
+						)
+					);
+				}
 				logger.debug(`trySpotFill done, took ${duration}ms`);
 
 				await this.watchdogTimerMutex.runExclusive(async () => {
