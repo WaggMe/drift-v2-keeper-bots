@@ -496,7 +496,7 @@ export class SpotFillerBot implements Bot {
 
 			if (getVariant(actionRecord.action) === 'fill') {
 				const marketType = getVariant(actionRecord.marketType);
-				if (marketType === 'spot') {
+				if (marketType === 'spot' && this.metricsPort && this.metricsInitialized) {
 					this.observedFillsCountCounter.add(1, {
 						market:
 							SpotMarkets[this.runtimeSpec.driftEnv][actionRecord.marketIndex]
@@ -769,7 +769,7 @@ export class SpotFillerBot implements Bot {
 			}
 
 			if (isEndIxLog(this.driftClient.program.programId.toBase58(), log)) {
-				if (!errorThisFillIx) {
+				if (!errorThisFillIx && this.metricsPort && this.metricsInitialized) {
 					this.successfulFillsCounter.add(1, {
 						market:
 							SpotMarkets[this.runtimeSpec.driftEnv][
@@ -1191,14 +1191,16 @@ export class SpotFillerBot implements Bot {
 					);
 				}
 
-				const user = this.driftClient.getUser();
-				this.attemptedFillsCounter.add(
-					fillableNodes.length,
-					metricAttrFromUserAccount(
-						user.userAccountPublicKey,
-						user.getUserAccount()
-					)
-				);
+				if(this.metricsPort && this.metricsInitialized){
+					const user = this.driftClient.getUser();
+					this.attemptedFillsCounter.add(
+						fillableNodes.length,
+						metricAttrFromUserAccount(
+							user.userAccountPublicKey,
+							user.getUserAccount()
+						)
+					);
+				}
 
 				for (const nodeToFill of fillableNodes) {
 					this.tryFillSpotNode(nodeToFill);
@@ -1208,14 +1210,16 @@ export class SpotFillerBot implements Bot {
 			});
 		} catch (e) {
 			if (e === E_ALREADY_LOCKED) {
-				const user = this.driftClient.getUser();
-				this.mutexBusyCounter.add(
-					1,
-					metricAttrFromUserAccount(
-						user.getUserAccountPublicKey(),
-						user.getUserAccount()
-					)
-				);
+				if(this.metricsPort && this.metricsInitialized){
+					const user = this.driftClient.getUser();
+					this.mutexBusyCounter.add(
+						1,
+						metricAttrFromUserAccount(
+							user.getUserAccountPublicKey(),
+							user.getUserAccount()
+						)
+					);
+				}
 			} else if (e === dlobMutexError) {
 				logger.error(`${this.name} dlobMutexError timeout`);
 			} else {
