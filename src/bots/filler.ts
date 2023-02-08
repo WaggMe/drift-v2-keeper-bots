@@ -442,7 +442,7 @@ export class FillerBot implements Bot {
 			const actionRecord = record as OrderActionRecord;
 			if (getVariant(actionRecord.action) === 'fill') {
 				const marketType = getVariant(actionRecord.marketType);
-				if (marketType === 'perp') {
+				if (marketType === 'perp' && this.metricsPort && this.metricsInitialized) {
 					this.observedFillsCountCounter.add(1, {
 						market:
 							PerpMarkets[this.runtimeSpec.driftEnv][actionRecord.marketIndex]
@@ -1337,14 +1337,16 @@ export class FillerBot implements Bot {
 				const duration = Date.now() - txStart;
 				logger.info(`sent tx: ${txSig}, took: ${duration}ms`);
 
-				const user = this.driftClient.getUser();
-				this.sdkCallDurationHistogram.record(duration, {
-					...metricAttrFromUserAccount(
-						user.getUserAccountPublicKey(),
-						user.getUserAccount()
-					),
-					method: 'sendTx',
-				});
+				if(this.metricsPort && this.metricsInitialized){
+					const user = this.driftClient.getUser();
+					this.sdkCallDurationHistogram.record(duration, {
+						...metricAttrFromUserAccount(
+							user.getUserAccountPublicKey(),
+							user.getUserAccount()
+						),
+						method: 'sendTx',
+					});
+				}	
 
 				const parseLogsStart = Date.now();
 				this.processBulkFillTxLogs(nodesSent, txSig)
@@ -1362,14 +1364,16 @@ export class FillerBot implements Bot {
 						}
 
 						// record successful fills
-						const user = this.driftClient.getUser();
-						this.successfulFillsCounter.add(
-							successfulFills,
-							metricAttrFromUserAccount(
-								user.userAccountPublicKey,
-								user.getUserAccount()
-							)
-						);
+						if(this.metricsPort && this.metricsInitialized){
+							const user = this.driftClient.getUser();
+							this.successfulFillsCounter.add(
+								successfulFills,
+								metricAttrFromUserAccount(
+									user.userAccountPublicKey,
+									user.getUserAccount()
+								)
+							);
+						}
 					})
 					.catch((e) => {
 						console.error(e);
@@ -1387,7 +1391,9 @@ export class FillerBot implements Bot {
 				logger.error(`Failed to send packed tx (error above):`);
 				const simError = e as SendTransactionError;
 				if (simError.logs && simError.logs.length > 0) {
-					this.txSimErrorCounter.add(1);
+					if(this.metricsPort && this.metricsInitialized){
+						this.txSimErrorCounter.add(1);
+					}
 					const start = Date.now();
 					await this.handleTransactionLogs(nodesSent, simError.logs);
 					logger.error(
@@ -1473,28 +1479,32 @@ export class FillerBot implements Bot {
 					filledNodeCount += attemptedFills;
 
 					// record fill attempts
-					const user = this.driftClient.getUser();
-					this.attemptedFillsCounter.add(
-						attemptedFills,
-						metricAttrFromUserAccount(
-							user.userAccountPublicKey,
-							user.getUserAccount()
-						)
-					);
+					if(this.metricsPort && this.metricsInitialized){
+						const user = this.driftClient.getUser();
+						this.attemptedFillsCounter.add(
+							attemptedFills,
+							metricAttrFromUserAccount(
+								user.userAccountPublicKey,
+								user.getUserAccount()
+							)
+						);
+					}
 				}
 
 				ran = true;
 			});
 		} catch (e) {
 			if (e === E_ALREADY_LOCKED) {
-				const user = this.driftClient.getUser();
-				this.mutexBusyCounter.add(
-					1,
-					metricAttrFromUserAccount(
-						user.getUserAccountPublicKey(),
-						user.getUserAccount()
-					)
-				);
+				if(this.metricsPort && this.metricsInitialized){
+					const user = this.driftClient.getUser();
+					this.mutexBusyCounter.add(
+						1,
+						metricAttrFromUserAccount(
+							user.getUserAccountPublicKey(),
+							user.getUserAccount()
+						)
+					);
+				}
 			} else if (e === dlobMutexError) {
 				logger.error(`${this.name} dlobMutexError timeout`);
 			} else {
@@ -1509,14 +1519,16 @@ export class FillerBot implements Bot {
 		} finally {
 			if (ran) {
 				const duration = Date.now() - startTime;
-				const user = this.driftClient.getUser();
-				this.tryFillDurationHistogram.record(
-					duration,
-					metricAttrFromUserAccount(
-						user.getUserAccountPublicKey(),
-						user.getUserAccount()
-					)
-				);
+				if(this.metricsPort && this.metricsInitialized){
+					const user = this.driftClient.getUser();
+					this.tryFillDurationHistogram.record(
+						duration,
+						metricAttrFromUserAccount(
+							user.getUserAccountPublicKey(),
+							user.getUserAccount()
+						)
+					);
+				}
 				logger.debug(`tryFill done, took ${duration}ms`);
 
 				await this.watchdogTimerMutex.runExclusive(async () => {
