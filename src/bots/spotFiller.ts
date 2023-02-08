@@ -207,14 +207,14 @@ export class SpotFillerBot implements Bot {
 		this.metricsPort = metricsPort;
 		if (this.metricsPort) {
 			this.initializeMetrics();
-		}
 
-		// load the pending tx atomic
-		for (const spotMarket of SpotMarkets[initializeMetrics
-			this.runtimeSpec.driftEnv as DriftEnv
-		]) {
-			if (spotMarket.serumMarket) {
-				Atomics.store(this.pendingTransactionsArray, spotMarket.marketIndex, 0);
+			// load the pending tx atomic
+			for (const spotMarket of SpotMarkets[this.initializeMetrics,
+				this.runtimeSpec.driftEnv as DriftEnv
+			]) {
+				if (spotMarket.serumMarket) {
+					Atomics.store(this.pendingTransactionsArray, spotMarket.marketIndex, 0);
+				}
 			}
 		}
 	}
@@ -1230,8 +1230,8 @@ export class SpotFillerBot implements Bot {
 			}
 		} finally {
 			if (ran) {
+				const duration = Date.now() - startTime;
 				if(this.metricsPort && this.metricsInitialized){
-					const duration = Date.now() - startTime;
 					const user = this.driftClient.getUser();
 					this.tryFillDurationHistogram.record(
 						duration,
