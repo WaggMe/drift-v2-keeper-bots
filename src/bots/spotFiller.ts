@@ -34,7 +34,12 @@ import {
 	MutexInterface,
 } from 'async-mutex';
 
-import { PublicKey } from '@solana/web3.js';
+import {
+	ComputeBudgetProgram,
+	PublicKey,
+	Transaction,
+	TransactionResponse,
+} from '@solana/web3.js';
 
 import { PrometheusExporter } from '@opentelemetry/exporter-prometheus';
 import {
@@ -54,13 +59,18 @@ import { logger } from '../logger';
 import { Bot } from '../types';
 import { RuntimeSpec, metricAttrFromUserAccount } from '../metrics';
 import { webhookMessage } from '../webhook';
+
+require('dotenv').config();
+const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
 import { getErrorCode } from '../error';
-
-require('dotenv').config();
-const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
-
-require('dotenv').config();
-const WEBHOOK_URL_FILLER = process.env.WEBHOOK_URL_FILLER;
+import {
+	isEndIxLog,
+	isFillIxLog,
+	isIxLog,
+	isMakerBreachedMaintenanceMarginLog,
+	isOrderDoesNotExistLog,
+	isTakerBreachedMaintenanceMarginLog,
+} from './common/txLogParse';
 
 /**
  * Size of throttled nodes to get to before pruning the map
@@ -86,7 +96,7 @@ const maxPriorityFee = 10000;
 const dlobMutexError = new Error('dlobMutex timeout');
 
 const errorCodesToSuppress = [
-	6061, // Error Number: 6061. Error Message: Order does not exist.
+	6061, // 0x17AD Error Number: 6061. Error Message: Order does not exist.
 ];
 
 enum METRIC_TYPES {
@@ -617,34 +627,40 @@ export class SpotFillerBot implements Bot {
 		let chUser: User;
 		let referrerInfo: ReferrerInfo;
 
-		await tryAcquire(this.userMapMutex).runExclusive(async () => {
-			if (nodeToFill.makerNode) {
-				const makerUserAccount = (
-					await this.userMap.mustGet(
-						nodeToFill.makerNode.userAccount.toString()
-					)
-				).getUserAccount();
-				const makerAuthority = makerUserAccount.authority;
-				const makerUserStats = (
-					await this.userStatsMap.mustGet(makerAuthority.toString())
-				).userStatsAccountPublicKey;
-				makerInfo = {
-					maker: nodeToFill.makerNode.userAccount,
-					makerUserAccount: makerUserAccount,
-					order: nodeToFill.makerNode.order,
-					makerStats: makerUserStats,
-				};
-			}
+		try {
+			await this.userMapMutex.runExclusive(async () => {
+				if (nodeToFill.makerNode) {
+					const makerUserAccount = (
+						await this.userMap.mustGet(
+							nodeToFill.makerNode.userAccount.toString()
+						)
+					).getUserAccount();
+					const makerAuthority = makerUserAccount.authority;
+					const makerUserStats = (
+						await this.userStatsMap.mustGet(makerAuthority.toString())
+					).userStatsAccountPublicKey;
+					makerInfo = {
+						maker: nodeToFill.makerNode.userAccount,
+						makerUserAccount: makerUserAccount,
+						order: nodeToFill.makerNode.order,
+						makerStats: makerUserStats,
+					};
+				}
 
-			chUser = await this.userMap.mustGet(
-				nodeToFill.node.userAccount.toString()
-			);
-			referrerInfo = (
-				await this.userStatsMap.mustGet(
-					chUser.getUserAccount().authority.toString()
-				)
-			).getReferrerInfo();
-		});
+				chUser = await this.userMap.mustGet(
+					nodeToFill.node.userAccount.toString()
+				);
+				referrerInfo = (
+					await this.userStatsMap.mustGet(
+						chUser.getUserAccount().authority.toString()
+					)
+				).getReferrerInfo();
+			});
+		} catch (e) {
+			if (e != E_ALREADY_LOCKED) {
+				throw new Error(`Error locking userMapMutex to fill node: ${e}`);
+			}
+		}
 
 		return Promise.resolve({
 			makerInfo,
@@ -718,6 +734,266 @@ export class SpotFillerBot implements Bot {
 		} else {
 			return maxPriorityFee / (computeUnitLimit * 1e-6);
 		}
+	}
+
+	private async sleep(ms: number) {
+		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+
+	private getFillSignatureFromUserAccountAndOrderId(
+		userAccount: string,
+		orderId: string
+	): string {
+		return `${userAccount}-${orderId}`;
+	}
+
+	/**
+	 * Iterates through a tx's logs and handles it appropriately 3e.g. throttling users, updating metrics, etc.)
+	 *
+	 * @param nodesFilled nodes that we sent a transaction to fill
+	 * @param logs logs from tx.meta.logMessages or this.clearingHouse.program._events._eventParser.parseLogs
+	 *
+	 * @returns number of nodes successfully filled
+	 */
+	private async handleTransactionLogs(
+		nodeFilled: NodeToFill,
+		logs: string[]
+	): Promise<number> {
+		let inFillIx = false;
+		let errorThisFillIx = false;
+		let successCount = 0;
+		for (const log of logs) {
+			if (log === null) {
+				logger.error(`log is null`);
+				continue;
+			}
+
+			if (isEndIxLog(this.driftClient.program.programId.toBase58(), log)) {
+				if (!errorThisFillIx) {
+					this.successfulFillsCounter.add(1, {
+						market:
+							SpotMarkets[this.runtimeSpec.driftEnv][
+								nodeFilled.node.order.marketIndex
+							].symbol,
+					});
+					successCount++;
+				}
+
+				inFillIx = false;
+				errorThisFillIx = false;
+				continue;
+			}
+
+			if (isIxLog(log)) {
+				if (isFillIxLog(log)) {
+					inFillIx = true;
+					errorThisFillIx = false;
+
+					// can also print this from parsing the log record in upcoming
+					if (nodeFilled.makerNode) {
+						logger.info(
+							`Processing spot fill tx log:\ntaker: ${nodeFilled.node.userAccount.toBase58()}-${
+								nodeFilled.node.order.orderId
+							} ${convertToNumber(
+								nodeFilled.node.order.baseAssetAmountFilled,
+								BASE_PRECISION
+							)}/${convertToNumber(
+								nodeFilled.node.order.baseAssetAmount,
+								BASE_PRECISION
+							)} @ ${convertToNumber(
+								nodeFilled.node.order.price,
+								PRICE_PRECISION
+							)}\nmaker: ${nodeFilled.makerNode.userAccount.toBase58()}-${
+								nodeFilled.makerNode.order.orderId
+							} ${convertToNumber(
+								nodeFilled.makerNode.order.baseAssetAmountFilled,
+								BASE_PRECISION
+							)}/${convertToNumber(
+								nodeFilled.makerNode.order.baseAssetAmount,
+								BASE_PRECISION
+							)} @ ${convertToNumber(
+								nodeFilled.makerNode.order.price,
+								PRICE_PRECISION
+							)}`
+						);
+					} else {
+						logger.info(
+							`Processing spot fill tx log:\ntaker: ${nodeFilled.node.userAccount.toBase58()}-${
+								nodeFilled.node.order.orderId
+							} ${convertToNumber(
+								nodeFilled.node.order.baseAssetAmountFilled,
+								BASE_PRECISION
+							)}/${convertToNumber(
+								nodeFilled.node.order.baseAssetAmount,
+								BASE_PRECISION
+							)} @ ${convertToNumber(
+								nodeFilled.node.order.price,
+								PRICE_PRECISION
+							)}\nmaker: OpenBook`
+						);
+					}
+				} else {
+					inFillIx = false;
+				}
+				continue;
+			}
+
+			if (!inFillIx) {
+				// this is not a log for a fill instruction
+				continue;
+			}
+
+			// try to handle the log line
+			const orderIdDoesNotExist = isOrderDoesNotExistLog(log);
+			if (orderIdDoesNotExist) {
+				logger.error(
+					`spot node filled: ${nodeFilled.node.userAccount.toString()}, ${
+						nodeFilled.node.order.orderId
+					}; does not exist (filled by someone else); ${log}`
+				);
+				this.throttledNodes.delete(this.getNodeToFillSignature(nodeFilled));
+				errorThisFillIx = true;
+				continue;
+			}
+
+			const makerBreachedMaintenanceMargin =
+				isMakerBreachedMaintenanceMarginLog(log);
+			if (makerBreachedMaintenanceMargin) {
+				if (!nodeFilled.makerNode) {
+					logger.error(
+						`Got maker breached maint. margin log, but don't have a maker node: ${log}\n${JSON.stringify(
+							nodeFilled,
+							null,
+							2
+						)}`
+					);
+					continue;
+				}
+				const makerNodeSignature =
+					this.getFillSignatureFromUserAccountAndOrderId(
+						nodeFilled.makerNode.userAccount.toString(),
+						nodeFilled.makerNode.order.orderId.toString()
+					);
+				logger.error(
+					`maker breach maint. margin, assoc node: ${nodeFilled.makerNode.userAccount.toString()}, ${
+						nodeFilled.makerNode.order.orderId
+					}; (throttling ${makerNodeSignature}); ${log}`
+				);
+				this.throttledNodes.set(makerNodeSignature, Date.now());
+				errorThisFillIx = true;
+
+				const tx = new Transaction();
+				tx.add(
+					ComputeBudgetProgram.requestUnits({
+						units: 1_000_000,
+						additionalFee: 0,
+					})
+				);
+				tx.add(
+					await this.driftClient.getForceCancelOrdersIx(
+						nodeFilled.makerNode.userAccount,
+						(
+							await this.userMap.mustGet(
+								nodeFilled.makerNode.userAccount.toString()
+							)
+						).getUserAccount()
+					)
+				);
+				this.driftClient.txSender
+					.send(tx, [], this.driftClient.opts)
+					.then((txSig) => {
+						logger.info(
+							`Force cancelled orders for maker ${nodeFilled.makerNode.userAccount.toBase58()} due to breach of maintenance margin. Tx: ${txSig}`
+						);
+					})
+					.catch((e) => {
+						console.error(e);
+						logger.error(`Failed to send ForceCancelOrder Ixs (error above):`);
+						webhookMessage(
+							`[${this.name}]: :x: error processing fill tx logs:\n${
+								e.stack ? e.stack : e.message
+							}`
+						);
+					});
+
+				continue;
+			}
+
+			const takerBreachedMaintenanceMargin =
+				isTakerBreachedMaintenanceMarginLog(log);
+			if (takerBreachedMaintenanceMargin) {
+				const takerNodeSignature =
+					this.getFillSignatureFromUserAccountAndOrderId(
+						nodeFilled.node.userAccount.toString(),
+						nodeFilled.node.order.orderId.toString()
+					);
+				logger.error(
+					`taker breach maint. margin, assoc node: ${nodeFilled.node.userAccount.toString()}, ${
+						nodeFilled.node.order.orderId
+					}; (throttling ${takerNodeSignature} and force cancelling orders); ${log}`
+				);
+				this.throttledNodes.set(takerNodeSignature, Date.now());
+				errorThisFillIx = true;
+
+				const tx = new Transaction();
+				tx.add(
+					ComputeBudgetProgram.requestUnits({
+						units: 1_000_000,
+						additionalFee: 0,
+					})
+				);
+				tx.add(
+					await this.driftClient.getForceCancelOrdersIx(
+						nodeFilled.node.userAccount,
+						(
+							await this.userMap.mustGet(nodeFilled.node.userAccount.toString())
+						).getUserAccount()
+					)
+				);
+
+				this.driftClient.txSender
+					.send(tx, [], this.driftClient.opts)
+					.then((txSig) => {
+						logger.info(
+							`Force cancelled orders for user ${nodeFilled.node.userAccount.toBase58()} due to breach of maintenance margin. Tx: ${txSig}`
+						);
+					})
+					.catch((e) => {
+						console.error(e);
+						logger.error(`Failed to send ForceCancelOrder Ixs (error above):`);
+						webhookMessage(
+							`[${this.name}]: :x: error processing fill tx logs:\n${
+								e.stack ? e.stack : e.message
+							}`
+						);
+					});
+
+				continue;
+			}
+		}
+
+		return successCount;
+	}
+
+	private async processBulkFillTxLogs(nodeToFill: NodeToFill, txSig: string) {
+		let tx: TransactionResponse | null = null;
+		let attempts = 0;
+		while (tx === null && attempts < 10) {
+			logger.info(`waiting for ${txSig} to be confirmed`);
+			tx = await this.driftClient.connection.getTransaction(txSig, {
+				commitment: 'confirmed',
+			});
+			attempts++;
+			// sleep 1s
+			await this.sleep(1000);
+		}
+
+		if (tx === null) {
+			logger.error(`tx ${txSig} not found`);
+			return 0;
+		}
+
+		return this.handleTransactionLogs(nodeToFill, tx.meta.logMessages);
 	}
 
 	private async tryFillSpotNode(nodeToFill: NodeToFill) {
@@ -818,9 +1094,12 @@ export class SpotFillerBot implements Bot {
 					computeUnitsPrice,
 				}
 			)
-			.then((txSig) => {
+			.then(async (txSig) => {
 				logger.info(`Filled spot order ${nodeSignature}, TX: ${txSig}`);
-
+				webhookMessage(
+					`[${this.name}]: Filled spot order ${nodeSignature}, TX: ${tx}`
+					,WEBHOOK_URL_FILLER
+				);
 				const pendingTxs = this.decPendingTransactions(
 					nodeToFill.node.order.marketIndex
 				);
@@ -840,13 +1119,8 @@ export class SpotFillerBot implements Bot {
 					),
 					method: 'fillSpotOrder',
 				});*/
-				// TODO: should parse the tx logs and determine if we were really successful
-				this.successfulFillsCounter.add(1, {
-					market:
-						SpotMarkets[this.runtimeSpec.driftEnv][
-							nodeToFill.node.order.marketIndex
-						].symbol,
-				});
+
+				await this.processBulkFillTxLogs(nodeToFill, txSig);
 			})
 			.catch((e) => {
 				const pendingTxs = this.decPendingTransactions(
@@ -858,12 +1132,15 @@ export class SpotFillerBot implements Bot {
 				console.error(e);
 
 				const errorCode = getErrorCode(e);
-				if (!errorCodesToSuppress.includes(errorCode)) {
+				if (
+					!errorCodesToSuppress.includes(errorCode) &&
+					!(e as Error).message.includes('Transaction was not confirmed')
+				) {
 					webhookMessage(
 						`[${this.name}]: :x: error trying to fill spot orders:\n${
 							e.logs ? (e.logs as Array<string>).join('\n') : ''
 						}\n${e.stack ? e.stack : e.message}`
-						,WEBHOOK_URL_FILLER
+          ,WEBHOOK_URL_FILLER
 					);
 				}
 			})
@@ -884,9 +1161,15 @@ export class SpotFillerBot implements Bot {
 						delete this.dlob;
 					}
 					this.dlob = new DLOB();
-					await tryAcquire(this.userMapMutex).runExclusive(async () => {
-						await this.dlob.initFromUserMap(this.userMap);
-					});
+					try {
+						await tryAcquire(this.userMapMutex).runExclusive(async () => {
+							await this.dlob.initFromUserMap(this.userMap);
+						});
+					} catch (e) {
+						if (e != E_ALREADY_LOCKED) {
+							throw new Error(`Failed to init DLOB from usermap: ${e}`);
+						}
+					}
 					if (orderRecord) {
 						this.dlob.insertOrder(orderRecord.order, orderRecord.user);
 					}
@@ -919,11 +1202,9 @@ export class SpotFillerBot implements Bot {
 					)
 				);*/
 
-				await Promise.all(
-					fillableNodes.map(async (spotNodeToFill) => {
-						await this.tryFillSpotNode(spotNodeToFill);
-					})
-				);
+				for (const nodeToFill of fillableNodes) {
+					this.tryFillSpotNode(nodeToFill);
+				}
 
 				ran = true;
 			});

@@ -139,6 +139,6 @@ src/**.js.map
 .idea
 
 .env
-.env-change-list.txt
+.env*
 lib
 ecosystem.config.js

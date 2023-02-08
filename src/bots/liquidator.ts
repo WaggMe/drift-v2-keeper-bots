@@ -55,10 +55,6 @@ require('dotenv').config();
 const WEBHOOK_URL_LIQUIDATOR = process.env.WEBHOOK_URL_LIQUIDATOR;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-require('dotenv').config();
-const WEBHOOK_URL_LIQUIDATOR = process.env.WEBHOOK_URL_LIQUIDATOR;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
-
 const USER_MAP_RESYNC_COOLDOWN_SLOTS = 50;
 
 const errorCodesToSuppress = [
@@ -219,7 +215,6 @@ async function liqPerpPnl(
 						`Error in liquidateBorrowForPerpPnl for userAccount ${user.userAccountPublicKey.toBase58()} on market ${
 							liquidateePosition.marketIndex
 						}`
-						,WEBHOOK_URL_LIQUIDATOR
 					);
 					logger.error(e);
 					const errorCode = getErrorCode(e);
@@ -232,7 +227,8 @@ async function liqPerpPnl(
 							}:\n${e.logs ? (e.logs as Array<string>).join('\n') : ''}\n${
 								e.stack ? e.stack : e.message
 							}`
-						);
+							,WEBHOOK_URL_LIQUIDATOR
+					);
 					}
 				})
 				/*.finally(() => {
