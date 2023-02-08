@@ -1105,6 +1105,11 @@ export class SpotFillerBot implements Bot {
 				);
 				logger.info(`done - currPendingTxs: ${pendingTxs}`);
 
+				webhookMessage(
+                                        `[${this.name}]: Filled spot order ${nodeSignature}, TX: ${txSig}`
+                                        ,WEBHOOK_URL_FILLER
+                                );
+
 				/*const duration = Date.now() - txStart;
 				const user = this.driftClient.getUser();
 				this.sdkCallDurationHistogram.record(duration, {

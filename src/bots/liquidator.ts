@@ -281,7 +281,7 @@ async function liqPerpPnl(
 							e.stack ? e.stack : e.message
 						}`
 						,WEBHOOK_URL_LIQUIDATOR
-				);
+					);
 				}
 			})
 			/*.finally(() => {
@@ -519,6 +519,17 @@ export class LiquidatorBot implements Bot {
 					this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM.toNumber()) *
 				100.0
 			}% per liquidation`
+		);
+		webhookMessage(
+			`${this.name} free collateral: $${convertToNumber(
+				freeCollateral,
+				QUOTE_PRECISION
+			)}, spending at most ${
+				(this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL.toNumber() /
+					this.MAX_POSITION_TAKEOVER_PCT_OF_COLLATERAL_DENOM.toNumber()) *
+				100.0
+			}% per liquidation`
+			,WEBHOOK_URL
 		);
 	}
 
@@ -992,10 +1003,8 @@ export class LiquidatorBot implements Bot {
 							`liquidating auth: ${auth}, userAccount: ${userKey}...`
 						);
 						webhookMessage(
-						
 							`[${this.name}]: liquidating auth: ${auth}: userAccount: ${userKey} ...`
-						,WEBHOOK_URL_LIQUIDATOR
-					
+							,WEBHOOK_URL_LIQUIDATOR
 						);
 
 						const liquidatorUser = this.driftClient.getUser();
@@ -1062,8 +1071,8 @@ export class LiquidatorBot implements Bot {
 											}]: :x: Error in liquidateSpot for userAccount ${user.userAccountPublicKey.toBase58()} on market ${depositMarketIndextoLiq} for borrow index: ${borrowMarketIndextoLiq}:\n${
 												e.logs ? (e.logs as Array<string>).join('\n') : ''
 											}\n${e.stack ? e.stack : e.message}`
-	                  ,WEBHOOK_URL_LIQUIDATOR
-									);
+											,WEBHOOK_URL_LIQUIDATOR
+										);
 									}
 								})
 								/*.finally(() => {
@@ -1185,8 +1194,8 @@ export class LiquidatorBot implements Bot {
 					`[${this.name}]: :x: uncaught error:\n${
 						e.stack ? e.stack : e.message
 					}`
-	         ,WEBHOOK_URL_LIQUIDATOR
-			);
+					,WEBHOOK_URL_LIQUIDATOR
+				);
 			}
 		} finally {
 			if (ran) {
